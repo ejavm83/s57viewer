@@ -1,0 +1,17 @@
+# Runtime cache (GeoJSON tiles)
+cache/
+
+# Local / IDE
+.claude/
+.vscode/
+.idea/
+*.pyc
+__pycache__/
+.venv/
+venv/
+.env
+.env.*
+
+# OS
+Thumbs.db
+.DS_Store
