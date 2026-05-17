@@ -2,17 +2,18 @@
     'use strict';
 
     const CATEGORIES = {
-        depth: ['DEPARE', 'DEPCNT', 'SBDARE'],
+        depth: ['DEPARE', 'DEPCNT', 'DRGARE', 'SBDARE', 'SEAARE'],
         sounding: ['SOUNDG'],
         light: ['LIGHTS', 'FOGSIG'],
-        beacon: ['BCNCAR', 'BCNISD', 'BCNLAT', 'RTPBCN'],
-        buoy: ['BOYISD', 'BOYLAT', 'BOYSAW', 'BOYSPP'],
+        beacon: ['BCNCAR', 'BCNISD', 'BCNLAT', 'BCNSAW', 'BCNSPP', 'RTPBCN', 'TOPMAR'],
+        buoy: ['BOYCAR', 'BOYISD', 'BOYLAT', 'BOYSAW', 'BOYSPP'],
         obstruction: ['OBSTRN', 'UWTROC'],
         wreck: ['WRECKS'],
-        land: ['LNDARE', 'LNDMRK', 'LNDELV', 'LNDRGN', 'LAKARE'],
+        land: ['LNDARE', 'LNDMRK', 'LNDELV', 'LNDRGN', 'LAKARE', 'BUAARE', 'RIVERS', 'CANALS'],
         coastline: ['COALNE', 'SLCONS'],
-        navigation: ['DWRTPT', 'TWRTPT', 'FERYRT', 'RDOCAL', 'RDOSTA', 'ACHBRT', 'CTRPNT'],
-        infrastructure: ['BRIDGE', 'CBLOHD', 'CBLSUB', 'PIPSOL', 'MORFAC', 'DAMCON', 'PONTON', 'PYLONS'],
+        navigation: ['DWRTPT', 'TWRTPT', 'FAIRWY', 'FERYRT', 'RDOCAL', 'RDOSTA', 'ACHBRT', 'ACHARE',
+            'CTRPNT', 'PILPNT', 'PILBOP', 'RESARE', 'TSSBND', 'TSELNE', 'ISTZNE', 'TSSLPT', 'TSSRON'],
+        infrastructure: ['BRIDGE', 'CBLOHD', 'CBLSUB', 'PIPSOL', 'MORFAC', 'DAMCON', 'PONTON', 'HULKES', 'PYLONS'],
         coverage: ['M_COVR', 'M_QUAL'],
     };
 
@@ -20,6 +21,9 @@
     let currentFeatures = null;
     let loadingAbort = null;
     let loadDebounce = null;
+    const VIEWPORT_LOAD_DEBOUNCE_MS = 50;
+    let mapViewInteracting = false;
+    const VIEWPORT_FETCH_BUFFER = 0.22;
     let preslibReady = false;
     let datasourceReady = false;
     let datasourceLoadActive = false;
@@ -30,6 +34,46 @@
     let viewportRetryDone = false;
     let mapReadyForPanLoad = false;
     let isFittingView = false;
+    let lastViewportCacheKey = null;
+    let lastStyleResolutionBucket = null;
+    let pointerMoveRaf = null;
+    const viewportChartCache = new Map();
+    const viewportOlCache = new Map();
+    const VIEWPORT_CACHE_MAX = 48;
+
+    /** Coarse resolution steps so S-52 style cache hits during smooth wheel zoom. */
+    function resolutionStyleBucket(resolution) {
+        if (!Number.isFinite(resolution) || resolution <= 0) return 1;
+        return Math.max(1, Math.round(resolution / 75) * 75);
+    }
+
+    function assignFeatureRenderOrder(features) {
+        for (let i = 0; i < features.length; i++) {
+            const layer = features[i].get('layer');
+            features[i].set('renderOrder', LAYER_ORDER[layer] ?? 50, true);
+        }
+    }
+
+    function refreshMapStylesIfNeeded() {
+        if (!preslibReady) return;
+        syncViewScaleDenom();
+        const bucket = resolutionStyleBucket(map.getView().getResolution());
+        if (bucket !== lastStyleResolutionBucket) {
+            lastStyleResolutionBucket = bucket;
+            vectorLayer.changed();
+        }
+    }
+    let userHasPannedMap = false;
+    let shouldRestoreLastView = true;
+    let usingDefaultSample = false;
+    let bootPreviewActive = false;
+    let bootPreviewPromise = null;
+    let bootBundlePrefetch = null;
+    let pendingDatasourceResult = null;
+    let cachedFullLoadReport = null;
+    let loadReportDetailsBound = false;
+    let datasourceDisplaySettled = false;
+    const geoJsonFormat = new ol.format.GeoJSON();
     /** Tighter focus than full ENC extent — matches peninsula demo view. */
     const KOREA_FOCUS_BOUNDS = [118, 32, 132, 42];
 
@@ -42,41 +86,69 @@
         return true;
     }
 
+    function isScaminEnabled() {
+        const el = document.getElementById('toggle-scamin');
+        return el ? el.checked : false;
+    }
+
+    function featurePassesZoomFilter(feature, resolution) {
+        const layer = feature.get('layer');
+        if (preslibReady && !s52.passesScaleLimits(feature.getProperties())) return false;
+        if (layer === 'SOUNDG' && resolution > 1200) return false;
+        if (layer === 'M_COVR' || layer === 'M_QUAL') return false;
+        if (layer === 'LNDRGN' && resolution > 2000) return false;
+        if (layer === 'LNDELV' && resolution > 600) return false;
+        if ((layer === 'LNDMRK' || layer === 'PILPNT') && resolution > 2500) return false;
+        if (layer === 'DEPCNT' && resolution > 2000) return false;
+        if ((layer === 'OBSTRN' || layer === 'UWTROC' || layer === 'WRECKS')
+            && feature.getGeometry().getType() === 'Point' && resolution > 2500) return false;
+        if (layer === 'TOPMAR' && resolution > 1500) return false;
+        return true;
+    }
+
+    function syncViewScaleDenom() {
+        if (!preslibReady) return;
+        s52.setViewScaleDenom(zoomToNearestScaleDenom(getZoomLevel()));
+    }
+
+    /** Popup only for layers enabled in Display Option and currently drawn. */
+    function isFeatureInspectable(feature, resolution) {
+        const layer = feature.get('layer');
+        if (!isLayerVisible(layer)) return false;
+        if (!featurePassesZoomFilter(feature, resolution)) return false;
+        if (!preslibReady) return false;
+        return s52.getStyle(feature, resolution) != null;
+    }
+
     function styleFunction(feature, resolution) {
         const layer = feature.get('layer');
         if (!isLayerVisible(layer)) return null;
-
-        if (layer === 'SOUNDG' && resolution > 200) return null;
-        if (layer === 'M_COVR') return null;
-        if (layer === 'M_QUAL') return null;
-        if ((layer === 'LNDRGN' || layer === 'LNDELV')) return null;
-        if ((layer === 'LNDMRK' || layer === 'TOPMAR' || layer === 'PILPNT') && resolution > 800) return null;
-        if (layer === 'DEPCNT' && resolution > 600) return null;
-        if ((layer === 'OBSTRN' || layer === 'UWTROC' || layer === 'WRECKS')
-            && feature.getGeometry().getType() === 'Point' && resolution > 800) return null;
-
+        if (!featurePassesZoomFilter(feature, resolution)) return null;
         if (!preslibReady) return null;
         return s52.getStyle(feature, resolution);
     }
 
-    // --- Z-index ordering for layers ---
+    // --- Z-index ordering for layers (S-52 display priority) ---
     const LAYER_ORDER = {
         'UNSARE': 0, 'M_COVR': 1, 'M_QUAL': 1,
-        'SEAARE': 2, 'DEPARE': 3, 'SBDARE': 3,
-        'LAKARE': 4, 'LNDARE': 5,
+        'SEAARE': 2, 'DEPARE': 3, 'DRGARE': 3, 'SBDARE': 3,
+        'LAKARE': 4, 'RIVERS': 4, 'CANALS': 4,
+        'LNDARE': 5, 'BUAARE': 6,
+        'FAIRWY': 7, 'RESARE': 8,
+        'TSSBND': 9, 'TSELNE': 9, 'ISTZNE': 9, 'TSSLPT': 9, 'TSSRON': 9,
         'DEPCNT': 10, 'COALNE': 11, 'SLCONS': 12,
-        'ACHBRT': 13, 'DWRTPT': 14, 'TWRTPT': 14,
+        'ACHBRT': 13, 'ACHARE': 13, 'DWRTPT': 14, 'TWRTPT': 14,
         'FERYRT': 15, 'CBLOHD': 16, 'CBLSUB': 16, 'PIPSOL': 17,
-        'BRIDGE': 18, 'DAMCON': 19, 'PONTON': 19, 'MORFAC': 19,
+        'BRIDGE': 18, 'DAMCON': 19, 'PONTON': 19, 'HULKES': 19, 'MORFAC': 19,
         'OBSTRN': 20, 'UWTROC': 21, 'WRECKS': 22,
         'SOUNDG': 25,
-        'BOYISD': 30, 'BOYLAT': 30, 'BOYSAW': 30, 'BOYSPP': 30,
-        'BCNCAR': 31, 'BCNISD': 31, 'BCNLAT': 31,
-        'TOPMAR': 32, 'PILPNT': 33,
+        'BOYCAR': 30, 'BOYISD': 30, 'BOYLAT': 30, 'BOYSAW': 30, 'BOYSPP': 30,
+        'BCNCAR': 31, 'BCNISD': 31, 'BCNLAT': 31, 'BCNSAW': 31, 'BCNSPP': 31,
+        'PILPNT': 33, 'PILBOP': 33,
         'LNDMRK': 34,
-        'LIGHTS': 40, 'FOGSIG': 41,
         'RTPBCN': 35, 'RDOSTA': 36, 'CTRPNT': 37,
-        'RDOCAL': 38,
+        'TOPMAR': 38, 'RDOCAL': 38,
+        'LIGHTS': 40, 'FOGSIG': 41,
     };
 
     // --- Map setup ---
@@ -87,37 +159,65 @@
         source: vectorSource,
         style: styleFunction,
         declutter: false,
+        renderBuffer: 256,
+        updateWhileAnimating: false,
+        updateWhileInteracting: false,
         renderOrder: function (a, b) {
-            const orderA = LAYER_ORDER[a.get('layer')] || 50;
-            const orderB = LAYER_ORDER[b.get('layer')] || 50;
-            return orderA - orderB;
+            return (a.get('renderOrder') ?? 50) - (b.get('renderOrder') ?? 50);
         },
     });
 
-    const map = new ol.Map({
+    const map = window._map = new ol.Map({
         target: 'map',
         layers: [vectorLayer],
         view: new ol.View({
             center: ol.proj.fromLonLat([127.5, 36.0]),
-            zoom: 6,
-            minZoom: 4,
-            maxZoom: 18,
+            zoom: 7,
+            minZoom: 3,
+            maxZoom: 21,
+            constrainResolution: false,
+            smoothResolutionConstraint: false,
         }),
         controls: ol.control.defaults.defaults().extend([
             new ol.control.ScaleLine(),
         ]),
+        interactions: ol.interaction.defaults.defaults({
+            mouseWheelZoom: new ol.interaction.MouseWheelZoom({
+                maxDelta: 8,
+                duration: 90,
+                timeout: 40,
+                constrainResolution: false,
+            }),
+            pinchZoom: new ol.interaction.PinchZoom({
+                duration: 90,
+                constrainResolution: false,
+            }),
+            doubleClickZoom: new ol.interaction.DoubleClickZoom({
+                delta: 2.5,
+                duration: 200,
+                constrainResolution: false,
+            }),
+        }),
     });
 
-    // Mouse position display
+    // Mouse position + cursor (hit-test throttled to one per animation frame)
     map.on('pointermove', function (evt) {
         const coord = ol.proj.toLonLat(evt.coordinate);
-        const lon = coord[0].toFixed(6);
-        const lat = coord[1].toFixed(6);
         const ns = coord[1] >= 0 ? 'N' : 'S';
         const ew = coord[0] >= 0 ? 'E' : 'W';
         document.getElementById('mouse-position').textContent =
             Math.abs(coord[1]).toFixed(6) + '°' + ns + '  ' +
             Math.abs(coord[0]).toFixed(6) + '°' + ew;
+        const pixel = evt.pixel.slice();
+        if (pointerMoveRaf !== null) return;
+        pointerMoveRaf = requestAnimationFrame(function () {
+            pointerMoveRaf = null;
+            const hit = map.hasFeatureAtPixel(pixel, {
+                hitTolerance: 5,
+                layerFilter: function (layer) { return layer === vectorLayer; },
+            });
+            map.getTargetElement().style.cursor = hit ? 'pointer' : '';
+        });
     });
 
     // --- Data loading ---
@@ -132,8 +232,221 @@
         return [...new Set(layers)];
     }
 
+    function getBootViewportParams() {
+        const [w, s, e, n] = KOREA_FOCUS_BOUNDS;
+        const [west, south, east, north] = expandViewportBounds(w, s, e, n);
+        return {
+            west: west,
+            south: south,
+            east: east,
+            north: north,
+            zoom: 7,
+            layers: getVisibleLayers().join(','),
+        };
+    }
+
+    function prefetchBootViewport() {
+        if (!globalThis.BootCache) return null;
+        if (!bootBundlePrefetch) {
+            bootBundlePrefetch = BootCache.loadDefaultViewport();
+        }
+        return bootBundlePrefetch;
+    }
+
+    function applyBootMapView(bundle) {
+        if (userHasPannedMap || !bundle) return;
+        const bounds = bundle.bounds
+            || (bundle.viewport
+                ? [bundle.viewport.west, bundle.viewport.south, bundle.viewport.east, bundle.viewport.north]
+                : null);
+        const displayBounds = pickDisplayBounds(bounds);
+        if (!displayBounds || displayBounds.length !== 4) return;
+        isFittingView = true;
+        mapReadyForPanLoad = false;
+        const extent = ol.proj.transformExtent(displayBounds, 'EPSG:4326', 'EPSG:3857');
+        map.getView().fit(extent, { padding: [40, 40, 40, 40], maxZoom: 9, duration: 0 });
+        isFittingView = false;
+    }
+
+    function applyBootPreviewBundle(bundle) {
+        const vp = bundle.viewport || getBootViewportParams();
+        const layerList = vp.layers ? vp.layers.split(',') : getVisibleLayers();
+        const cacheKey = getViewportCacheKey(vp.west, vp.south, vp.east, vp.north, vp.zoom, layerList);
+        applyChartData(bundle.data, cacheKey);
+        rememberViewportCache(cacheKey, bundle.data);
+        lastViewportCacheKey = cacheKey;
+        if (bundle.data.meta && bundle.data.meta.s52_settings) {
+            applyS52Settings(bundle.data.meta.s52_settings);
+        }
+        applyBootMapView(bundle);
+        bootPreviewActive = true;
+        mapDisplayReady = true;
+        mapReadyForPanLoad = false;
+        showLoading(datasourceLoadActive, datasourceLoadActive ? 'subtle' : false);
+        if (!datasourceLoadActive) showViewportUpdating(false);
+        const pathEl = document.getElementById('datasource-path');
+        if (pathEl && !datasourceReady) {
+            const label = bundle.source === 'idb' ? 'cached demo' : 'demo preview';
+            pathEl.textContent = `Showing ${label} — loading chart index…`;
+            pathEl.classList.add('loaded');
+        }
+        updateInfo(
+            bundle.data.meta && bundle.data.meta.charts_loaded,
+            bundle.data.meta && bundle.data.meta.total_features
+        );
+        vectorLayer.changed();
+        map.render();
+    }
+
+    async function tryBootPreview() {
+        if (bootPreviewActive || userHasPannedMap || !preslibReady) {
+            return false;
+        }
+        if (!globalThis.BootCache) return false;
+        if (bootPreviewPromise) return bootPreviewPromise;
+
+        bootPreviewPromise = (async function () {
+            try {
+                const dsResp = await fetch('/api/datasource');
+                const ds = await dsResp.json();
+                if (ds.loaded && !isDefaultSampleLoaded(ds)) return false;
+            } catch (e) {
+                /* continue with bundled preview */
+            }
+
+            if (userHasPannedMap) return false;
+
+            const bundle = bootBundlePrefetch
+                ? await bootBundlePrefetch
+                : await BootCache.loadDefaultViewport();
+            bootBundlePrefetch = null;
+            if (!bundle || !bundle.data || !bundle.data.features || !bundle.data.features.length) {
+                return false;
+            }
+            if (userHasPannedMap) return false;
+
+            applyBootPreviewBundle(bundle);
+            return true;
+        })().finally(function () {
+            bootPreviewPromise = null;
+        });
+
+        return bootPreviewPromise;
+    }
+
+    function maybePersistBootCache(west, south, east, north, zoom, layers, data) {
+        if (!usingDefaultSample || userHasPannedMap || !globalThis.BootCache) return;
+        const params = getBootViewportParams();
+        const sameView =
+            Math.abs(west - params.west) < 0.05
+            && Math.abs(south - params.south) < 0.05
+            && Math.abs(east - params.east) < 0.05
+            && Math.abs(north - params.north) < 0.05
+            && zoom === params.zoom;
+        if (!sameView) return;
+        BootCache.saveDefaultViewport({
+            bounds: pickDisplayBounds(lastDatasourceBounds),
+            viewport: {
+                west: west,
+                south: south,
+                east: east,
+                north: north,
+                zoom: zoom,
+                layers: layers.join(','),
+            },
+            data: data,
+        });
+    }
+
     function getZoomLevel() {
         return Math.round(map.getView().getZoom());
+    }
+
+    function roundViewportCoord(value) {
+        return Math.round(value * 40) / 40;
+    }
+
+    function expandViewportBounds(west, south, east, north) {
+        const spanLon = east - west;
+        const spanLat = north - south;
+        const padLon = spanLon * VIEWPORT_FETCH_BUFFER;
+        const padLat = spanLat * VIEWPORT_FETCH_BUFFER;
+        return [
+            west - padLon,
+            south - padLat,
+            east + padLon,
+            north + padLat,
+        ];
+    }
+
+    function getViewportCacheKey(west, south, east, north, zoom, layers) {
+        return [
+            roundViewportCoord(west),
+            roundViewportCoord(south),
+            roundViewportCoord(east),
+            roundViewportCoord(north),
+            zoom,
+            layers.join(','),
+            isScaminEnabled() ? '1' : '0',
+        ].join('|');
+    }
+
+    function rememberViewportCache(key, data) {
+        if (viewportChartCache.has(key)) {
+            viewportChartCache.delete(key);
+            viewportOlCache.delete(key);
+        }
+        viewportChartCache.set(key, data);
+        while (viewportChartCache.size > VIEWPORT_CACHE_MAX) {
+            const oldest = viewportChartCache.keys().next().value;
+            viewportChartCache.delete(oldest);
+            viewportOlCache.delete(oldest);
+        }
+    }
+
+    function parseChartFeatures(data, cacheKey) {
+        if (cacheKey && viewportOlCache.has(cacheKey)) {
+            return viewportOlCache.get(cacheKey);
+        }
+        const features = geoJsonFormat.readFeatures(data, {
+            featureProjection: 'EPSG:3857',
+            dataProjection: 'EPSG:4326',
+        });
+        assignFeatureRenderOrder(features);
+        if (cacheKey) {
+            viewportOlCache.set(cacheKey, features);
+        }
+        return features;
+    }
+
+    function applyChartData(data, cacheKey, opts) {
+        const keepIfEmpty = opts && opts.keepIfEmpty;
+        const chartsMatched = data.meta && (data.meta.charts_matched || 0);
+        const features = parseChartFeatures(data, cacheKey);
+        // Keep prior draw only when charts overlap this view but nothing was returned (cap/filter).
+        if (
+            keepIfEmpty
+            && features.length === 0
+            && vectorSource.getFeatures().length > 0
+            && chartsMatched > 0
+        ) {
+            if (data.meta) renderViewportReport(data.meta);
+            return false;
+        }
+        if (features.length === 0) {
+            vectorSource.clear();
+            currentFeatures = data;
+            updateInfo(0, 0);
+            if (data.meta) renderViewportReport(data.meta);
+            return false;
+        }
+        vectorSource.clear();
+        vectorSource.addFeatures(features);
+        currentFeatures = data;
+        lastStyleResolutionBucket = null;
+        updateInfo(data.meta.charts_loaded, data.meta.total_features);
+        renderViewportReport(data.meta);
+        return true;
     }
 
     function waitForNextMapRender(timeoutMs) {
@@ -161,33 +474,56 @@
     async function loadCharts() {
         if (!datasourceReady) return;
 
-        if (mapReadyForPanLoad && loadingAbort) loadingAbort.abort();
-        loadingAbort = new AbortController();
-        const signal = loadingAbort.signal;
-        const token = ++chartLoadToken;
-
         const extent = map.getView().calculateExtent(map.getSize());
-        const [west, south] = ol.proj.toLonLat([extent[0], extent[1]]);
-        const [east, north] = ol.proj.toLonLat([extent[2], extent[3]]);
+        const [viewWest, viewSouth] = ol.proj.toLonLat([extent[0], extent[1]]);
+        const [viewEast, viewNorth] = ol.proj.toLonLat([extent[2], extent[3]]);
+        const [west, south, east, north] = expandViewportBounds(viewWest, viewSouth, viewEast, viewNorth);
         const zoom = getZoomLevel();
-
         const visibleLayers = getVisibleLayers();
+        const keepIfEmpty = mapDisplayReady;
+
         if (visibleLayers.length === 0) {
             vectorSource.clear();
             updateInfo(0, 0);
             renderViewportReport(null);
             mapDisplayReady = true;
             showLoading(false);
+            showViewportUpdating(false);
             return;
         }
 
-        showLoading(true);
-        updateProgressUI({
-            message: mapDisplayReady ? 'Updating chart display…' : 'Loading chart features for map…',
-            percent: null,
-            detail: `Zoom ${zoom}`,
-            indeterminate: true,
-        });
+        const cacheKey = getViewportCacheKey(west, south, east, north, zoom, visibleLayers);
+        if (cacheKey === lastViewportCacheKey && mapDisplayReady) {
+            return;
+        }
+
+        const cached = viewportChartCache.get(cacheKey);
+        if (cached) {
+            lastViewportCacheKey = cacheKey;
+            applyChartData(cached, cacheKey, { keepIfEmpty: keepIfEmpty });
+            mapDisplayReady = true;
+            mapReadyForPanLoad = true;
+            return;
+        }
+
+        const isViewportUpdate = mapDisplayReady;
+        if (mapReadyForPanLoad && loadingAbort) loadingAbort.abort();
+        loadingAbort = new AbortController();
+        const signal = loadingAbort.signal;
+        const token = ++chartLoadToken;
+        if (isViewportUpdate) {
+            showLoading(false);
+            showViewportUpdating(true);
+        } else {
+            showViewportUpdating(false);
+            showLoading(true, bootPreviewActive ? 'subtle' : undefined);
+            updateProgressUI({
+                message: 'Loading chart features for map…',
+                percent: null,
+                detail: `Zoom ${zoom}`,
+                indeterminate: true,
+            });
+        }
 
         const fetchTimeoutMs = 90000;
         let abortedByTimeout = false;
@@ -197,7 +533,8 @@
         }, fetchTimeoutMs);
 
         try {
-            const url = `/api/charts?west=${west}&south=${south}&east=${east}&north=${north}&zoom=${zoom}&layers=${visibleLayers.join(',')}`;
+            const scaminFlag = isScaminEnabled() ? 1 : 0;
+            const url = `/api/charts?west=${west}&south=${south}&east=${east}&north=${north}&zoom=${zoom}&layers=${visibleLayers.join(',')}&scamin=${scaminFlag}`;
             const resp = await fetch(url, { signal });
             if (signal.aborted || token !== chartLoadToken) return;
             if (!resp.ok) {
@@ -207,37 +544,39 @@
             const data = await resp.json();
             if (signal.aborted || token !== chartLoadToken) return;
 
-            vectorSource.clear();
-
-            const format = new ol.format.GeoJSON();
-            const features = format.readFeatures(data, {
-                featureProjection: 'EPSG:3857',
-                dataProjection: 'EPSG:4326',
-            });
-
-            vectorSource.addFeatures(features);
-            currentFeatures = data;
-            updateInfo(data.meta.charts_loaded, data.meta.total_features);
-            renderViewportReport(data.meta);
-
-            updateProgressUI({
-                message: 'Rendering chart on map…',
-                percent: null,
-                detail: data.meta.total_features
-                    ? `${data.meta.total_features.toLocaleString()} features`
-                    : `Zoom ${zoom}`,
-                indeterminate: true,
-            });
-
-            if (signal.aborted || token !== chartLoadToken) return;
-            await waitForNextMapRender();
-            if (signal.aborted || token !== chartLoadToken) return;
-
+            rememberViewportCache(cacheKey, data);
+            lastViewportCacheKey = cacheKey;
+            applyChartData(data, cacheKey, { keepIfEmpty: keepIfEmpty });
+            if (data.meta && data.meta.s52_settings) {
+                applyS52Settings(data.meta.s52_settings);
+            }
+            maybePersistBootCache(west, south, east, north, zoom, visibleLayers, data);
             mapDisplayReady = true;
+            bootPreviewActive = false;
+
+            if ((data.meta.charts_loaded || 0) > 0 || (data.meta.charts_matched || 0) > 0) {
+                viewportRetryDone = true;
+            }
+
+            if (!isViewportUpdate) {
+                updateProgressUI({
+                    message: 'Rendering chart on map…',
+                    percent: null,
+                    detail: data.meta.total_features
+                        ? `${data.meta.total_features.toLocaleString()} features`
+                        : `Zoom ${zoom}`,
+                    indeterminate: true,
+                });
+                if (signal.aborted || token !== chartLoadToken) return;
+                await waitForNextMapRender(3000);
+                if (signal.aborted || token !== chartLoadToken) return;
+            }
+
             mapReadyForPanLoad = true;
 
             if (
                 !viewportRetryDone
+                && !userHasPannedMap
                 && indexedChartCount > 0
                 && (data.meta.charts_matched || 0) === 0
                 && lastDatasourceBounds
@@ -247,25 +586,39 @@
             }
         } catch (e) {
             if (e.name === 'AbortError' && abortedByTimeout && token === chartLoadToken) {
-                updateProgressUI({
-                    message: 'Chart load timed out',
-                    percent: null,
-                    detail: 'Try zooming in or reducing display layers',
-                    indeterminate: true,
-                });
+                if (!isViewportUpdate) {
+                    updateProgressUI({
+                        message: 'Chart load timed out',
+                        percent: null,
+                        detail: 'Try zooming in or reducing display layers',
+                        indeterminate: true,
+                    });
+                }
             } else if (e.name !== 'AbortError') {
                 console.error('Failed to load charts:', e);
-                updateProgressUI({
-                    message: 'Could not load chart display',
-                    percent: null,
-                    detail: e.message || '',
-                    indeterminate: true,
-                });
+                if (isViewportUpdate && mapDisplayReady) {
+                    vectorSource.clear();
+                    currentFeatures = null;
+                    lastViewportCacheKey = null;
+                    updateInfo(0, 0);
+                    renderViewportReport(null);
+                } else if (!isViewportUpdate) {
+                    updateProgressUI({
+                        message: 'Could not load chart display',
+                        percent: null,
+                        detail: e.message || '',
+                        indeterminate: true,
+                    });
+                }
             }
         } finally {
             clearTimeout(timeoutId);
-            if (token === chartLoadToken && !signal.aborted) {
-                showLoading(false);
+            if (token === chartLoadToken) {
+                if (isViewportUpdate) {
+                    showViewportUpdating(false);
+                } else if (!signal.aborted) {
+                    showLoading(false);
+                }
             }
             if (!mapReadyForPanLoad && datasourceReady && !isFittingView) {
                 mapReadyForPanLoad = true;
@@ -273,10 +626,65 @@
         }
     }
 
-    function debouncedLoad() {
-        if (!datasourceReady || !mapReadyForPanLoad || isFittingView) return;
+    function canScheduleChartLoad() {
+        return datasourceReady && mapReadyForPanLoad && !isFittingView;
+    }
+
+    function setMapViewInteracting(active) {
+        mapViewInteracting = active;
+        const container = document.getElementById('map-container');
+        if (container) container.classList.toggle('map-interacting', active);
+    }
+
+    function updateInfoZoomScaleOnly() {
+        const zoom = getZoomLevel();
+        document.getElementById('info-zoom').textContent = zoom;
+        const scales = {
+            4: '1:50,000,000', 5: '1:25,000,000', 6: '1:10,000,000',
+            7: '1:5,000,000', 8: '1:3,500,000', 9: '1:700,000',
+            10: '1:350,000', 11: '1:180,000', 12: '1:90,000',
+            13: '1:45,000', 14: '1:22,000', 15: '1:12,000',
+            16: '1:6,000', 17: '1:3,000', 18: '1:1,500',
+        };
+        document.getElementById('info-scale').textContent =
+            scales[zoom] || '~1:' + Math.round(559082264 / Math.pow(2, zoom)).toLocaleString();
+        syncScaleSelect(zoomToNearestScaleDenom(zoom));
+    }
+
+    function finalizeMapViewAfterInteraction() {
+        if (!preslibReady) return;
+        syncScaleSelect(zoomToNearestScaleDenom(getZoomLevel()));
+        refreshMapStylesIfNeeded();
+        updateInfo(
+            parseInt(document.getElementById('info-charts').textContent, 10) || 0,
+            parseInt(document.getElementById('info-features').textContent.replace(/,/g, ''), 10) || 0
+        );
+    }
+
+    function scheduleViewportLoad() {
+        if (!canScheduleChartLoad()) return;
+        if (mapDisplayReady) userHasPannedMap = true;
         if (loadDebounce) clearTimeout(loadDebounce);
-        loadDebounce = setTimeout(loadCharts, 400);
+        loadDebounce = setTimeout(loadCharts, VIEWPORT_LOAD_DEBOUNCE_MS);
+    }
+
+    function onMapMoveStart() {
+        if (isFittingView) return;
+        setMapViewInteracting(true);
+        if (loadDebounce) {
+            clearTimeout(loadDebounce);
+            loadDebounce = null;
+        }
+        if (loadingAbort && mapDisplayReady) {
+            loadingAbort.abort();
+            loadingAbort = null;
+        }
+    }
+
+    function onMapMoveEnd() {
+        setMapViewInteracting(false);
+        finalizeMapViewAfterInteraction();
+        scheduleViewportLoad();
     }
 
     function pickDisplayBounds(bounds) {
@@ -303,40 +711,61 @@
         return `W ${bounds[0].toFixed(2)}° S ${bounds[1].toFixed(2)}° E ${bounds[2].toFixed(2)}° N ${bounds[3].toFixed(2)}°`;
     }
 
-    function renderFolderLoadReport(report) {
-        const panel = document.getElementById('load-report-panel');
-        const summaryEl = document.getElementById('load-report-summary');
-        const detailEl = document.getElementById('load-report-detail-body');
-        if (!panel || !summaryEl || !detailEl || !report) return;
+    function bindLoadReportDetailsToggle() {
+        if (loadReportDetailsBound) return;
+        const details = document.getElementById('load-report-details');
+        if (!details) return;
+        loadReportDetailsBound = true;
+        details.addEventListener('toggle', () => {
+            if (details.open) void ensureLoadReportDetails();
+        });
+    }
 
-        const s = report.summary || {};
-        const bands = s.scale_bands || {};
+    function renderLoadReportSummary(summary) {
+        const summaryEl = document.getElementById('load-report-summary');
+        if (!summaryEl || !summary) return;
+
+        const cacheNote = summary.from_cache
+            ? 'From cache'
+            : (summary.duration_sec != null ? `${summary.duration_sec}s` : '');
+
+        summaryEl.innerHTML = `
+            <div class="report-stat-grid">
+                <div class="report-stat"><strong>${summary.files_found ?? 0}</strong><span>.000 files found</span></div>
+                <div class="report-stat"><strong>${summary.indexed_ok ?? 0}</strong><span>indexed OK</span></div>
+                <div class="report-stat"><strong>${summary.indexed_failed ?? 0}</strong><span>failed</span></div>
+                <div class="report-stat"><strong>${(summary.layers_per_chart?.avg ?? 0)}</strong><span>avg layers/chart</span></div>
+            </div>
+            ${cacheNote ? `<p class="report-note report-note-compact">${escapeHtml(cacheNote)}</p>` : ''}
+        `;
+    }
+
+    function renderLoadReportExtra(summary) {
+        const extraEl = document.getElementById('load-report-extra');
+        if (!extraEl || !summary) return;
+
+        const bands = summary.scale_bands || {};
         const bandRows = Object.keys(bands).sort((a, b) => Number(a) - Number(b))
             .map(b => `<tr><td>${escapeHtml(bands[b].label)}</td><td>${bands[b].count}</td></tr>`)
             .join('');
 
-        const topLayers = (s.top_layers || [])
+        const topLayers = (summary.top_layers || [])
             .map(l => `<tr><td>${escapeHtml(l.layer)}</td><td>${l.charts}</td></tr>`)
             .join('');
 
-        const cacheNote = s.from_cache
-            ? 'Index loaded from cache (faster).'
-            : (s.duration_sec != null ? `Indexed in ${s.duration_sec}s.` : '');
-
-        summaryEl.innerHTML = `
-            <div class="report-stat-grid">
-                <div class="report-stat"><strong>${s.files_found ?? 0}</strong><span>.000 files found</span></div>
-                <div class="report-stat"><strong>${s.indexed_ok ?? 0}</strong><span>indexed OK</span></div>
-                <div class="report-stat"><strong>${s.indexed_failed ?? 0}</strong><span>failed</span></div>
-                <div class="report-stat"><strong>${(s.layers_per_chart?.avg ?? 0)}</strong><span>avg layers/chart</span></div>
-            </div>
+        extraEl.innerHTML = `
             <table class="report-scale-table">
                 <thead><tr><th>Scale band</th><th>Charts</th></tr></thead>
                 <tbody>${bandRows || '<tr><td colspan="2">—</td></tr>'}</tbody>
             </table>
             ${topLayers ? `<table class="report-scale-table"><thead><tr><th>Top layers</th><th>Charts</th></tr></thead><tbody>${topLayers}</tbody></table>` : ''}
-            <p class="report-note">${escapeHtml(formatBounds(s.bounds))}${cacheNote ? '<br>' + escapeHtml(cacheNote) : ''}</p>
+            <p class="report-note">${escapeHtml(formatBounds(summary.bounds))}</p>
         `;
+    }
+
+    function renderLoadReportPerChart(report) {
+        const detailEl = document.getElementById('load-report-detail-body');
+        if (!detailEl || !report) return;
 
         const indexed = report.indexed || [];
         const failed = report.failed || [];
@@ -373,28 +802,89 @@
         }
 
         detailEl.innerHTML = detailHtml;
+    }
+
+    function renderFolderLoadReport(report) {
+        const panel = document.getElementById('load-report-panel');
+        if (!panel || !report?.summary) return;
+
+        bindLoadReportDetailsToggle();
+        renderLoadReportSummary(report.summary);
+
+        const details = document.getElementById('load-report-details');
+        if (details?.open) {
+            renderLoadReportExtra(report.summary);
+            if (report.indexed || report.failed) {
+                renderLoadReportPerChart(report);
+            }
+        } else {
+            document.getElementById('load-report-extra')?.replaceChildren();
+            document.getElementById('load-report-detail-body')?.replaceChildren();
+        }
+
+        if (report.indexed || report.failed) {
+            cachedFullLoadReport = report;
+        } else if (report.summary) {
+            cachedFullLoadReport = { summary: report.summary };
+        }
+
         panel.classList.remove('hidden');
     }
 
     function hideFolderLoadReport() {
-        document.getElementById('load-report-panel')?.classList.add('hidden');
+        cachedFullLoadReport = null;
+        const panel = document.getElementById('load-report-panel');
+        panel?.classList.add('hidden');
+        const details = document.getElementById('load-report-details');
+        if (details) details.open = false;
+        document.getElementById('load-report-extra')?.replaceChildren();
+        document.getElementById('load-report-detail-body')?.replaceChildren();
     }
 
-    async function fetchAndRenderFolderReport(existingReport) {
-        if (existingReport && existingReport.indexed) {
+    async function ensureLoadReportDetails() {
+        const extraEl = document.getElementById('load-report-extra');
+        const detailEl = document.getElementById('load-report-detail-body');
+        if (!extraEl || !detailEl) return;
+
+        if (cachedFullLoadReport?.summary) {
+            renderLoadReportExtra(cachedFullLoadReport.summary);
+            if (cachedFullLoadReport.indexed || cachedFullLoadReport.failed) {
+                renderLoadReportPerChart(cachedFullLoadReport);
+                return;
+            }
+        }
+
+        detailEl.innerHTML = '<p class="report-note">Loading chart list…</p>';
+        if (!cachedFullLoadReport?.summary) {
+            extraEl.innerHTML = '<p class="report-note">Loading details…</p>';
+        }
+
+        try {
+            const resp = await fetch('/api/datasource/report');
+            if (!resp.ok) {
+                extraEl.innerHTML = '<p class="report-note">Could not load details.</p>';
+                return;
+            }
+            const report = await resp.json();
+            cachedFullLoadReport = report;
+            if (report.summary) renderLoadReportSummary(report.summary);
+            renderLoadReportExtra(report.summary || {});
+            renderLoadReportPerChart(report);
+        } catch (e) {
+            console.warn('Could not load folder report:', e);
+            extraEl.innerHTML = '<p class="report-note">Could not load details.</p>';
+        }
+    }
+
+    function fetchAndRenderFolderReport(existingReport) {
+        if (existingReport?.summary) {
+            if (existingReport.indexed || existingReport.failed) {
+                cachedFullLoadReport = existingReport;
+            }
             renderFolderLoadReport(existingReport);
             return;
         }
-        try {
-            const resp = await fetch('/api/datasource/report');
-            if (resp.ok) {
-                renderFolderLoadReport(await resp.json());
-            } else if (existingReport?.summary) {
-                renderFolderLoadReport({ summary: existingReport.summary, indexed: [], failed: [] });
-            }
-        } catch (e) {
-            console.warn('Could not load folder report:', e);
-        }
+        bindLoadReportDetailsToggle();
     }
 
     function renderViewportReport(meta) {
@@ -404,13 +894,17 @@
         if (!details || !body || !meta) return;
 
         if (matchedEl) {
-            const matched = meta.charts_matched ?? meta.charts_loaded ?? 0;
+            const loaded = meta.charts_loaded ?? 0;
+            const matched = meta.charts_matched != null ? meta.charts_matched : loaded;
+            const shown = matched > 0 ? matched : (loaded > 0 ? loaded : 0);
             matchedEl.textContent = meta.charts_capped
-                ? `${matched} (${meta.charts_loaded} drawn, max ${meta.max_charts})`
-                : String(matched);
+                ? `${shown} (${loaded} drawn, max ${meta.max_charts})`
+                : String(shown);
         }
 
-        if (!meta.charts_matched && !meta.charts_loaded) {
+        const chartsLoaded = meta.charts_loaded ?? 0;
+        const chartsMatched = meta.charts_matched != null ? meta.charts_matched : chartsLoaded;
+        if (!chartsMatched && !chartsLoaded) {
             details.classList.remove('hidden');
             body.innerHTML = `<p class="report-note">No charts match this view at zoom ${meta.zoom}. ` +
                 `Try zooming out for overview charts (Ocean/Coastal) or zooming in for Harbour charts.</p>`;
@@ -425,7 +919,14 @@
         }
 
         const scaleLabels = (meta.target_scale_labels || []).join(', ');
-        let html = `<p class="report-note">Zoom ${meta.zoom} · scales: ${escapeHtml(scaleLabels || '—')}</p>`;
+        let capNote = '';
+        if (meta.features_capped) {
+            capNote = ` · feature cap ${(meta.max_features || 0).toLocaleString()}`;
+        }
+        if (meta.skipped_layers && meta.skipped_layers.length) {
+            capNote += ` · hidden at zoom: ${meta.skipped_layers.join(', ')}`;
+        }
+        let html = `<p class="report-note">Zoom ${meta.zoom} · scales: ${escapeHtml(scaleLabels || '—')}${escapeHtml(capNote)}</p>`;
 
         if (meta.charts && meta.charts.length) {
             html += `<table><thead><tr><th>Chart</th><th>Scale</th><th>Features</th></tr></thead><tbody>`;
@@ -499,17 +1000,68 @@
         }
     }
 
-    function onDatasourceLoaded(data) {
-        datasourceReady = true;
-        mapReadyForPanLoad = false;
+    async function finishDatasourceDisplay(data) {
+        if (datasourceDisplaySettled) {
+            if (isDefaultSampleLoaded(data) && mapDisplayReady) {
+                setTimeout(tryLoadCharts, 50);
+            }
+            return;
+        }
+        datasourceDisplaySettled = true;
+        usingDefaultSample = isDefaultSampleLoaded(data);
         indexedChartCount = data.chart_count || 0;
         lastDatasourceBounds = data.bounds || null;
         viewportRetryDone = false;
         updateDatasourceUI(data);
         fetchAndRenderFolderReport(data.report);
+        if (data.s52_settings) applyS52Settings(data.s52_settings);
+        else fetchS52Settings();
         map.updateSize();
+
+        const hadBootOnMap = bootPreviewActive
+            && mapDisplayReady
+            && vectorSource.getFeatures().length > 0;
+
+        if (hadBootOnMap && usingDefaultSample) {
+            showLoading(false);
+            showViewportUpdating(false);
+            const savedView = shouldRestoreLastView ? getSavedLastView() : null;
+            shouldRestoreLastView = false;
+            if (savedView) {
+                animateMapTo(savedView.lon, savedView.lat, savedView.scale);
+                userHasPannedMap = true;
+                setTimeout(tryLoadCharts, 550);
+            } else {
+                setTimeout(tryLoadCharts, 50);
+            }
+            return;
+        }
+
+        const bootShown = await tryBootPreview();
+        if (bootShown && usingDefaultSample) {
+            showLoading(false);
+            const savedView = shouldRestoreLastView ? getSavedLastView() : null;
+            shouldRestoreLastView = false;
+            if (savedView) {
+                animateMapTo(savedView.lon, savedView.lat, savedView.scale);
+                userHasPannedMap = true;
+                setTimeout(tryLoadCharts, 550);
+            } else {
+                setTimeout(tryLoadCharts, 80);
+            }
+            return;
+        }
+
+        mapDisplayReady = false;
+        bootPreviewActive = false;
+        mapReadyForPanLoad = false;
+        lastViewportCacheKey = null;
+        viewportChartCache.clear();
+        viewportOlCache.clear();
+        userHasPannedMap = false;
+        showLoading(true, 'subtle');
         updateProgressUI({
-            message: preslibReady ? 'Preparing chart display…' : 'Loading chart symbology (S-52)…',
+            message: 'Preparing chart display…',
             percent: null,
             detail: data.chart_count ? `${data.chart_count} chart(s) ready` : '',
             indeterminate: true,
@@ -517,16 +1069,90 @@
         const afterFit = () => {
             setTimeout(tryLoadCharts, 150);
         };
-        if (indexedChartCount > 0) {
+        const savedView = shouldRestoreLastView ? getSavedLastView() : null;
+        shouldRestoreLastView = false;
+        if (savedView) {
+            animateMapTo(savedView.lon, savedView.lat, savedView.scale);
+            userHasPannedMap = true;
+            setTimeout(afterFit, 550);
+        } else if (indexedChartCount > 0) {
             fitMapToBounds(data.bounds || KOREA_FOCUS_BOUNDS, afterFit);
         } else {
             afterFit();
         }
     }
 
+    function onDatasourceLoaded(data) {
+        datasourceReady = true;
+        pendingDatasourceResult = data;
+        if (!preslibReady) {
+            usingDefaultSample = isDefaultSampleLoaded(data);
+            indexedChartCount = data.chart_count || 0;
+            lastDatasourceBounds = data.bounds || null;
+            updateDatasourceUI(data);
+            fetchAndRenderFolderReport(data.report);
+            if (data.s52_settings) applyS52Settings(data.s52_settings);
+            if (!mapDisplayReady) {
+                updateProgressUI({
+                    message: 'Loading chart symbology (S-52)…',
+                    percent: null,
+                    detail: data.chart_count ? `${data.chart_count} chart(s) indexed` : '',
+                    indeterminate: true,
+                });
+            }
+            return;
+        }
+        pendingDatasourceResult = null;
+        void finishDatasourceDisplay(data);
+    }
+
     function setDatasourceButtonsDisabled(disabled) {
         const browse = document.getElementById('btn-browse-folder');
+        const folderInput = document.getElementById('folder-file-input');
         if (browse) browse.disabled = disabled;
+        if (folderInput) folderInput.disabled = disabled;
+    }
+
+    function setDatasourceStatusMessage(message, options) {
+        const pathEl = document.getElementById('datasource-path');
+        const countEl = document.getElementById('datasource-count');
+        if (!pathEl) return;
+        pathEl.textContent = message;
+        pathEl.title = (options && options.title) || '';
+        if (countEl) countEl.textContent = (options && options.count) || '';
+        pathEl.classList.toggle('loaded', !!(options && options.loaded));
+    }
+
+    function beginFolderLoadUI(message) {
+        hideFolderLoadReport();
+        datasourceDisplaySettled = false;
+        bootPreviewActive = false;
+        showLoading(true);
+        setDatasourceButtonsDisabled(true);
+        datasourceLoadActive = true;
+        setDatasourceStatusMessage(message || 'Preparing folder load…', { loaded: false });
+        updateProgressUI({
+            message: message || 'Preparing folder load…',
+            percent: null,
+            detail: '',
+            indeterminate: true,
+        });
+    }
+
+    function finishFolderLoadUI() {
+        datasourceLoadActive = false;
+        setDatasourceButtonsDisabled(false);
+    }
+
+    async function completeDatasourceLoadFromResponse(data) {
+        if (data.status === 'started') {
+            const result = await waitForDatasourceLoad();
+            onDatasourceLoaded(result);
+            return;
+        }
+        if (data.loaded) {
+            onDatasourceLoaded(data);
+        }
     }
 
     function sleep(ms) {
@@ -591,19 +1217,73 @@
         }
     }
 
-    async function browseServerFolder() {
-        if (datasourceLoadActive) return;
+    async function uploadFolderCharts(files) {
+        const chartFiles = files.filter(f => f.name && f.name.toLowerCase().endsWith('.000'));
+        if (!chartFiles.length) {
+            setDatasourceStatusMessage('No .000 chart files in the selected folder.');
+            showLoading(false);
+            finishFolderLoadUI();
+            return;
+        }
 
-        hideFolderLoadReport();
-        showLoading(true);
-        setDatasourceButtonsDisabled(true);
-        datasourceLoadActive = true;
-        updateProgressUI({
-            message: 'Select folder in the dialog…',
-            percent: null,
-            detail: '',
-            indeterminate: true,
-        });
+        beginFolderLoadUI(`Uploading ${chartFiles.length} chart file(s)…`);
+        const form = new FormData();
+        for (const file of chartFiles) {
+            const rel = file.webkitRelativePath || file.name;
+            form.append('files', file, rel);
+        }
+
+        try {
+            const resp = await fetch('/api/datasource/upload?mode=replace', {
+                method: 'POST',
+                body: form,
+            });
+            const data = await resp.json();
+            if (!resp.ok) throw new Error(data.detail || 'Failed to upload chart folder');
+            await completeDatasourceLoadFromResponse(data);
+        } catch (e) {
+            console.error(e);
+            alert('Could not load folder:\n' + e.message);
+            setDatasourceStatusMessage('Folder upload failed');
+            showLoading(false);
+        } finally {
+            finishFolderLoadUI();
+        }
+    }
+
+    function browseFolderViaBrowser() {
+        if (datasourceLoadActive) {
+            setDatasourceStatusMessage('Chart data is still loading — please wait…');
+            return;
+        }
+        const input = document.getElementById('folder-file-input');
+        if (!input) {
+            browseServerFolder();
+            return;
+        }
+        setDatasourceStatusMessage('Choose a folder in the file dialog…');
+        input.value = '';
+        input.click();
+    }
+
+    async function onFolderInputChange(evt) {
+        const input = evt.target;
+        const files = input && input.files ? Array.from(input.files) : [];
+        input.value = '';
+        if (!files.length) {
+            setDatasourceStatusMessage('Folder selection cancelled');
+            return;
+        }
+        await uploadFolderCharts(files);
+    }
+
+    async function browseServerFolder() {
+        if (datasourceLoadActive) {
+            setDatasourceStatusMessage('Chart data is still loading — please wait…');
+            return;
+        }
+
+        beginFolderLoadUI('Select folder in the server dialog (check the taskbar if hidden)…');
 
         try {
             const resp = await fetch('/api/datasource/browse?mode=replace', {
@@ -611,24 +1291,29 @@
             });
             const data = await resp.json();
             if (data.cancelled) {
+                setDatasourceStatusMessage(
+                    data.reason === 'no_dialog'
+                        ? 'Server folder dialog unavailable — use Select folder without Shift'
+                        : 'Folder selection cancelled'
+                );
                 showLoading(false);
                 return;
             }
             if (!resp.ok) throw new Error(data.detail || 'Failed to load folder');
-            if (data.status === 'started') {
-                const result = await waitForDatasourceLoad();
-                onDatasourceLoaded(result);
-            } else if (data.loaded) {
-                onDatasourceLoaded(data);
-            }
+            await completeDatasourceLoadFromResponse(data);
         } catch (e) {
             console.error(e);
             alert('Could not load folder:\n' + e.message);
+            setDatasourceStatusMessage('Could not load folder');
             showLoading(false);
         } finally {
-            datasourceLoadActive = false;
-            setDatasourceButtonsDisabled(false);
+            finishFolderLoadUI();
         }
+    }
+
+    function onBrowseFolderClick(evt) {
+        if (evt.shiftKey) browseServerFolder();
+        else browseFolderViaBrowser();
     }
 
     function normalizePath(p) {
@@ -657,7 +1342,7 @@
     async function ensureDefaultSampleOnConnect() {
         datasourceLoadActive = true;
         setDatasourceButtonsDisabled(true);
-        showLoading(true);
+        showLoading(true, 'subtle');
         try {
             const dsResp = await fetch('/api/datasource');
             const ds = await dsResp.json();
@@ -701,18 +1386,35 @@
         }
     }
 
-    map.getView().on('change:resolution', debouncedLoad);
-    map.getView().on('change:center', debouncedLoad);
+    map.on('movestart', onMapMoveStart);
+    map.on('moveend', onMapMoveEnd);
+    map.getView().on('change:resolution', function () {
+        updateInfoZoomScaleOnly();
+        if (!mapViewInteracting) {
+            refreshMapStylesIfNeeded();
+        }
+    });
 
     // --- UI ---
 
-    function showLoading(show) {
+    function showLoading(show, mode) {
         const el = document.getElementById('loading-indicator');
         const container = document.getElementById('map-container');
         if (!el) return;
+        const subtle = show && mode === 'subtle';
         el.classList.toggle('hidden', !show);
+        el.classList.toggle('viewport-subtle', subtle);
         el.setAttribute('aria-busy', show ? 'true' : 'false');
-        if (container) container.classList.toggle('map-loading', show);
+        if (container) {
+            container.classList.toggle('map-loading', show && !subtle);
+            if (show) container.classList.remove('map-updating');
+        }
+    }
+
+    function showViewportUpdating(show) {
+        const container = document.getElementById('map-container');
+        if (!container) return;
+        container.classList.toggle('map-updating', show);
     }
 
     function setLoadingMessage(text) {
@@ -757,8 +1459,12 @@
                 const allAreChecked = Array.from(allChecked).every(c => c.checked);
                 allCb.checked = allAreChecked;
             }
-            if (preslibReady) s52._styleCache = {};
+            if (preslibReady) s52.clearStyleCache();
+            lastStyleResolutionBucket = null;
             vectorLayer.changed();
+            lastViewportCacheKey = null;
+            scheduleViewportLoad();
+            hideFeaturePopup();
         });
     });
 
@@ -767,12 +1473,16 @@
         vectorLayer.setVisible(this.checked);
     });
 
-    // Feature popup
-    map.on('click', function (evt) {
-        const features = map.getFeaturesAtPixel(evt.pixel, { hitTolerance: 5 });
-        if (features && features.length > 0) {
-            const feature = features[0];
-            showFeaturePopup(feature);
+    // Feature popup on double-click (Display Option enabled layers only; topmost drawn feature wins)
+    map.on('dblclick', function (evt) {
+        const resolution = map.getView().getResolution();
+        const hits = map.getFeaturesAtPixel(evt.pixel, { hitTolerance: 5 }) || [];
+        const inspectable = hits
+            .filter(f => isFeatureInspectable(f, resolution))
+            .sort((a, b) => (LAYER_ORDER[b.get('layer')] || 50) - (LAYER_ORDER[a.get('layer')] || 50));
+        if (inspectable.length > 0) {
+            evt.preventDefault();
+            showFeaturePopup(inspectable[0]);
         } else {
             hideFeaturePopup();
         }
@@ -787,7 +1497,8 @@
         const props = feature.getProperties();
         delete props.geometry;
 
-        title.textContent = layer + (props.OBJNAM ? ' - ' + props.OBJNAM : '');
+        const displayName = props.NOBJNM || props.OBJNAM;
+        title.textContent = layer + (displayName ? ' - ' + displayName : '');
 
         let html = '<table>';
         for (const [key, val] of Object.entries(props)) {
@@ -827,25 +1538,412 @@
         return code + ' (' + (descriptions[code] || 'Unknown') + ')';
     }
 
+    // --- Scale / zoom helpers (shared by scale bar and view bookmarks) ---
+
+    const SCALE_TO_ZOOM = {
+        50000000: 4, 10000000: 6, 3500000: 8,
+        700000: 9, 180000: 11, 111000: 12, 90000: 12,
+        22000: 14, 12000: 15,
+    };
+    const ZOOM_TO_SCALE_DENOM = {
+        4: 50000000, 5: 25000000, 6: 10000000,
+        7: 5000000, 8: 3500000, 9: 700000,
+        10: 350000, 11: 180000, 12: 90000,
+        13: 45000, 14: 22000, 15: 12000,
+        16: 6000, 17: 3000, 18: 1500,
+    };
+    const SCALE_SELECT_VALUES = Object.keys(SCALE_TO_ZOOM).map(Number);
+
+    function scaleDenomToZoom(scaleDenom) {
+        const exact = SCALE_TO_ZOOM[scaleDenom];
+        if (exact != null) return exact;
+        let bestZoom = 6;
+        let bestDiff = Infinity;
+        for (const [z, denom] of Object.entries(ZOOM_TO_SCALE_DENOM)) {
+            const diff = Math.abs(denom - scaleDenom);
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                bestZoom = Number(z);
+            }
+        }
+        return bestZoom;
+    }
+
+    function scaleToZoom(scaleDenom) {
+        return scaleDenomToZoom(scaleDenom);
+    }
+
+    function zoomToNearestScaleDenom(zoom) {
+        const exact = ZOOM_TO_SCALE_DENOM[zoom];
+        if (exact) return exact;
+        let best = SCALE_SELECT_VALUES[0];
+        let bestDiff = Infinity;
+        for (const denom of SCALE_SELECT_VALUES) {
+            const z = scaleToZoom(denom);
+            const diff = Math.abs(z - zoom);
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                best = denom;
+            }
+        }
+        return best;
+    }
+
+    function syncScaleSelect(scaleDenom) {
+        const sel = document.getElementById('scale-select');
+        if (!sel) return;
+        const val = String(scaleDenom);
+        if (sel.querySelector(`option[value="${val}"]`)) {
+            sel.value = val;
+        }
+    }
+
+    function animateMapTo(lon, lat, scaleDenom) {
+        const zoom = scaleToZoom(scaleDenom);
+        map.getView().animate({
+            center: ol.proj.fromLonLat([lon, lat]),
+            zoom,
+            duration: 500,
+        });
+        syncScaleSelect(scaleDenom);
+        if (mapDisplayReady) userHasPannedMap = true;
+        saveLastViewToStorage();
+    }
+
     // Scale select
     document.getElementById('scale-select').addEventListener('change', function () {
-        const scale = parseInt(this.value);
-        const zoomLevels = {
-            50000000: 4, 10000000: 6, 3500000: 8,
-            700000: 9, 180000: 11, 90000: 12,
-            22000: 14, 12000: 15,
-        };
-        const zoom = zoomLevels[scale] || 6;
-        map.getView().animate({ zoom, duration: 500 });
+        const scale = parseInt(this.value, 10);
+        map.getView().animate({ zoom: scaleToZoom(scale), duration: 500 });
     });
 
-    // Disclaimer
-    document.getElementById('btn-disclaimer').addEventListener('click', function () {
-        alert('DISCLAIMER\n\nThis S-57 chart viewer is for demonstration and educational purposes only.\nIt cannot be used for navigation.\nThe chart data may not be current or accurate.\nAlways use official nautical charts for navigation.');
+    // --- View bookmarks (keys 1–9, Ctrl+1–9 to save) ---
+
+    const VIEW_BOOKMARKS_STORAGE_KEY = 's57viewer-view-bookmarks';
+    const VIEW_BOOKMARKS_SECTION_OPEN_KEY = 's57viewer-bookmarks-section-open';
+    const LAST_VIEW_STORAGE_KEY = 's57viewer-last-view';
+    let lastViewSaveTimer = null;
+
+    const DEFAULT_VIEW_BOOKMARKS = [
+        { label: 'Korea overview', lon: 127.5, lat: 36.0, scale: 10000000 },
+        { label: 'Seoul', lon: 126.98, lat: 37.55, scale: 3500000 },
+        { label: 'Busan', lon: 129.04, lat: 35.10, scale: 700000 },
+        { label: 'Incheon', lon: 126.62, lat: 37.45, scale: 700000 },
+        { label: 'Jeju', lon: 126.53, lat: 33.38, scale: 700000 },
+        { label: 'East coast', lon: 129.5, lat: 37.5, scale: 3500000 },
+        { label: 'West coast', lon: 125.5, lat: 36.0, scale: 3500000 },
+        { label: 'Jindo (1:111k)', lon: 126.12, lat: 34.51, scale: 111000 },
+        { label: 'Harbour detail', lon: 126.60, lat: 37.45, scale: 22000 },
+    ];
+
+    let viewBookmarks = [];
+    let bookmarkToastTimer = null;
+
+    function cloneDefaultBookmarks() {
+        return DEFAULT_VIEW_BOOKMARKS.map(function (b) {
+            return { label: b.label, lon: b.lon, lat: b.lat, scale: b.scale };
+        });
+    }
+
+    function normalizeBookmark(raw, fallback) {
+        const lon = Number(raw && raw.lon);
+        const lat = Number(raw && raw.lat);
+        let scale = parseInt(raw && raw.scale, 10);
+        if (!Number.isFinite(scale) || scale <= 0) {
+            scale = fallback ? fallback.scale : 10000000;
+        }
+        return {
+            label: (raw && raw.label) || (fallback && fallback.label) || '',
+            lon: Number.isFinite(lon) ? lon : fallback.lon,
+            lat: Number.isFinite(lat) ? lat : fallback.lat,
+            scale,
+        };
+    }
+
+    function loadViewBookmarks() {
+        const defaults = cloneDefaultBookmarks();
+        try {
+            const raw = localStorage.getItem(VIEW_BOOKMARKS_STORAGE_KEY);
+            if (!raw) return defaults;
+            const parsed = JSON.parse(raw);
+            if (!Array.isArray(parsed) || parsed.length === 0) return defaults;
+            const result = defaults.slice();
+            for (let i = 0; i < 9 && i < parsed.length; i++) {
+                result[i] = normalizeBookmark(parsed[i], defaults[i]);
+            }
+            return result;
+        } catch (e) {
+            return defaults;
+        }
+    }
+
+    function saveViewBookmarksToStorage() {
+        try {
+            localStorage.setItem(VIEW_BOOKMARKS_STORAGE_KEY, JSON.stringify(viewBookmarks));
+        } catch (e) {
+            console.warn('Could not save view bookmarks:', e);
+        }
+    }
+
+    function getSavedLastView() {
+        try {
+            const raw = localStorage.getItem(LAST_VIEW_STORAGE_KEY);
+            if (!raw) return null;
+            const v = JSON.parse(raw);
+            const lon = Number(v.lon);
+            const lat = Number(v.lat);
+            const scale = parseInt(v.scale, 10);
+            if (!Number.isFinite(lon) || !Number.isFinite(lat)) return null;
+            if (!Number.isFinite(scale) || scale <= 0) return null;
+            return { lon, lat, scale };
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function saveLastViewToStorage() {
+        try {
+            const coord = ol.proj.toLonLat(map.getView().getCenter());
+            const scale = zoomToNearestScaleDenom(getZoomLevel());
+            localStorage.setItem(LAST_VIEW_STORAGE_KEY, JSON.stringify({
+                lon: coord[0],
+                lat: coord[1],
+                scale,
+            }));
+        } catch (e) {
+            console.warn('Could not save last view:', e);
+        }
+    }
+
+    function scheduleSaveLastView() {
+        if (isFittingView) return;
+        if (!userHasPannedMap && !mapDisplayReady) return;
+        if (lastViewSaveTimer) clearTimeout(lastViewSaveTimer);
+        lastViewSaveTimer = setTimeout(saveLastViewToStorage, 400);
+    }
+
+    function formatScaleLabel(scaleDenom) {
+        const labels = {
+            50000000: '1:50M', 10000000: '1:10M', 3500000: '1:3.5M',
+            700000: '1:700k', 180000: '1:180k', 111000: '1:111k', 90000: '1:90k',
+            22000: '1:22k', 12000: '1:12k',
+        };
+        return labels[scaleDenom] || ('1:' + scaleDenom.toLocaleString());
+    }
+
+    function showBookmarkToast(message) {
+        const el = document.getElementById('bookmark-toast');
+        if (!el) return;
+        el.textContent = message;
+        el.classList.add('is-visible');
+        if (bookmarkToastTimer) clearTimeout(bookmarkToastTimer);
+        bookmarkToastTimer = setTimeout(function () {
+            el.classList.remove('is-visible');
+        }, 2200);
+    }
+
+    function bookmarkSlotTitle(slot) {
+        const bm = viewBookmarks[slot - 1];
+        if (!bm) return `Slot ${slot}: click to save current view`;
+        const ns = bm.lat >= 0 ? 'N' : 'S';
+        const ew = bm.lon >= 0 ? 'E' : 'W';
+        const pos = Math.abs(bm.lat).toFixed(2) + '°' + ns + ', ' +
+            Math.abs(bm.lon).toFixed(2) + '°' + ew;
+        return `Slot ${slot}: ${formatScaleLabel(bm.scale)} @ ${pos}\nClick: save · Key ${slot}: go`;
+    }
+
+    function captureBookmarkFromMap(slot) {
+        const coord = ol.proj.toLonLat(map.getView().getCenter());
+        const scale = zoomToNearestScaleDenom(getZoomLevel());
+        const bm = viewBookmarks[slot - 1] || {};
+        viewBookmarks[slot - 1] = {
+            label: bm.label || `Bookmark ${slot}`,
+            lon: coord[0],
+            lat: coord[1],
+            scale,
+        };
+        saveViewBookmarksToStorage();
+        renderViewBookmarksUI();
+        showBookmarkToast(`${slot} saved · ${formatScaleLabel(scale)}`);
+        return viewBookmarks[slot - 1];
+    }
+
+    function goToViewBookmark(slot) {
+        const bm = viewBookmarks[slot - 1];
+        if (!bm || !Number.isFinite(bm.lon) || !Number.isFinite(bm.lat)) return;
+        animateMapTo(bm.lon, bm.lat, bm.scale);
+    }
+
+    function renderViewBookmarksUI() {
+        const list = document.getElementById('view-bookmarks-list');
+        if (!list) return;
+        let html = '';
+        for (let slot = 1; slot <= 9; slot++) {
+            html += `<button type="button" class="bookmark-slot is-saved" data-slot="${slot}" title="${escapeHtml(bookmarkSlotTitle(slot))}">${slot}</button>`;
+        }
+        list.innerHTML = html;
+
+        list.querySelectorAll('.bookmark-slot').forEach(function (btn) {
+            btn.addEventListener('click', function () {
+                captureBookmarkFromMap(Number(btn.dataset.slot));
+            });
+            btn.addEventListener('dblclick', function (evt) {
+                evt.preventDefault();
+                goToViewBookmark(Number(btn.dataset.slot));
+            });
+        });
+    }
+
+    function isTypingTarget(el) {
+        if (!el) return false;
+        const tag = el.tagName;
+        return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+    }
+
+    const KEYBOARD_PAN_PIXELS = 96;
+    const KEYBOARD_ZOOM_STEP = 1;
+
+    function panMapByKeyboardPixels(pixelX, pixelY) {
+        const view = map.getView();
+        const resolution = view.getResolution();
+        const center = view.getCenter();
+        if (!resolution || !center) return;
+        view.animate({
+            center: [
+                center[0] + pixelX * resolution,
+                center[1] + pixelY * resolution,
+            ],
+            duration: 100,
+        });
+    }
+
+    function zoomMapByKeyboard(delta) {
+        const view = map.getView();
+        const current = view.getZoom();
+        if (current === undefined) return;
+        const min = view.getMinZoom() ?? 0;
+        const max = view.getMaxZoom() ?? 28;
+        const next = Math.min(max, Math.max(min, current + delta));
+        if (next === current) return;
+        view.animate({ zoom: next, duration: 150 });
+    }
+
+    function attachMapKeyboardControls() {
+        document.addEventListener('keydown', function (evt) {
+            if (isTypingTarget(evt.target)) return;
+            if (evt.ctrlKey || evt.metaKey || evt.altKey) return;
+
+            const key = evt.key;
+            let pixelX = 0;
+            let pixelY = 0;
+            if (key === 'ArrowLeft') pixelX = KEYBOARD_PAN_PIXELS;
+            else if (key === 'ArrowRight') pixelX = -KEYBOARD_PAN_PIXELS;
+            else if (key === 'ArrowUp') pixelY = KEYBOARD_PAN_PIXELS;
+            else if (key === 'ArrowDown') pixelY = -KEYBOARD_PAN_PIXELS;
+
+            if (pixelX !== 0 || pixelY !== 0) {
+                evt.preventDefault();
+                panMapByKeyboardPixels(pixelX, pixelY);
+                return;
+            }
+
+            let zoomDelta = 0;
+            if (key === '+' || key === '=' || key === 'Add') zoomDelta = KEYBOARD_ZOOM_STEP;
+            else if (key === '-' || key === '_' || key === 'Subtract') zoomDelta = -KEYBOARD_ZOOM_STEP;
+
+            if (zoomDelta !== 0) {
+                evt.preventDefault();
+                zoomMapByKeyboard(zoomDelta);
+            }
+        });
+    }
+
+    function isAdminMode() {
+        return document.documentElement.classList.contains('admin-mode');
+    }
+
+    function attachViewBookmarkKeyboard() {
+        document.addEventListener('keydown', function (evt) {
+            if (!isAdminMode()) return;
+            if (isTypingTarget(evt.target)) return;
+            const key = evt.key;
+            if (key.length !== 1 || key < '1' || key > '9') return;
+            const slot = Number(key);
+            if (evt.ctrlKey || evt.metaKey) {
+                evt.preventDefault();
+                captureBookmarkFromMap(slot);
+                return;
+            }
+            if (evt.altKey || evt.shiftKey) return;
+            evt.preventDefault();
+            goToViewBookmark(slot);
+        });
+    }
+
+    viewBookmarks = loadViewBookmarks();
+    renderViewBookmarksUI();
+    attachMapKeyboardControls();
+    attachViewBookmarkKeyboard();
+
+    (function initBookmarksSectionCollapsible() {
+        const details = document.getElementById('view-bookmarks-details');
+        if (!details) return;
+        try {
+            const stored = localStorage.getItem(VIEW_BOOKMARKS_SECTION_OPEN_KEY);
+            if (stored === '0') details.open = false;
+            else if (stored === '1') details.open = true;
+        } catch (e) { /* ignore */ }
+        details.addEventListener('toggle', function () {
+            try {
+                localStorage.setItem(VIEW_BOOKMARKS_SECTION_OPEN_KEY, details.open ? '1' : '0');
+            } catch (e) { /* ignore */ }
+        });
+    })();
+
+    map.getView().on('change:center', scheduleSaveLastView);
+    map.getView().on('change:resolution', scheduleSaveLastView);
+    window.addEventListener('beforeunload', saveLastViewToStorage);
+
+    document.getElementById('btn-reset-bookmarks')?.addEventListener('click', function () {
+        if (!confirm('Reset all 9 view bookmarks to defaults?')) return;
+        viewBookmarks = cloneDefaultBookmarks();
+        saveViewBookmarksToStorage();
+        renderViewBookmarksUI();
     });
+
+    function applyS52Settings(settings) {
+        if (!settings || !preslibReady) return;
+        const patch = {};
+        if (settings.shallowContour != null) patch.shallowContour = settings.shallowContour;
+        if (settings.safetyContour != null) patch.safetyContour = settings.safetyContour;
+        if (settings.deepContour != null) patch.deepContour = settings.deepContour;
+        if (settings.safetyDepth != null) patch.safetyDepth = settings.safetyDepth;
+        if (Object.keys(patch).length) {
+            s52.setSettings(patch);
+            vectorLayer.changed();
+        }
+    }
+
+    async function fetchS52Settings() {
+        const sources = ['/s52-settings.json', '/api/datasource'];
+        for (const url of sources) {
+            try {
+                const resp = await fetch(url);
+                if (!resp.ok) continue;
+                const data = await resp.json();
+                const settings = data.s52_settings || data;
+                if (settings.shallowContour != null || settings.safetyContour != null) {
+                    applyS52Settings(settings);
+                    return;
+                }
+            } catch (e) {
+                /* try next source */
+            }
+        }
+    }
 
     async function initPreslib() {
-        if (!datasourceReady) {
+        prefetchBootViewport();
+        if (!mapDisplayReady && !datasourceReady) {
             updateProgressUI({
                 message: 'Loading chart symbology (S-52)…',
                 percent: null,
@@ -854,29 +1952,53 @@
             });
         }
         try {
-            await s52.load('/s52-preslib.json');
+            await s52.load('/s52-preslib.json?v=9');
             preslibReady = true;
+            attachPresLibControls();
+            syncViewScaleDenom();
             const sea = s52.getSeaColor();
             document.getElementById('map').style.backgroundColor = sea;
             updateLegendColors();
             vectorLayer.changed();
-            if (datasourceReady) {
-                if (!mapDisplayReady) {
-                    updateProgressUI({
-                        message: 'Preparing chart display…',
-                        percent: null,
-                        detail: '',
-                        indeterminate: true,
-                    });
-                }
-                tryLoadCharts();
+
+            const bootShown = await tryBootPreview();
+            if (bootShown) showLoading(false);
+
+            if (pendingDatasourceResult) {
+                const pending = pendingDatasourceResult;
+                pendingDatasourceResult = null;
+                await finishDatasourceDisplay(pending);
+            } else if (datasourceReady && !datasourceDisplaySettled) {
+                const ds = await fetch('/api/datasource').then(function (r) { return r.json(); });
+                await finishDatasourceDisplay(ds);
+            } else if (datasourceReady && datasourceDisplaySettled && bootPreviewActive && mapDisplayReady) {
+                setTimeout(tryLoadCharts, 50);
+            } else if (!bootShown) {
+                showLoading(true, mapDisplayReady ? 'subtle' : undefined);
+                updateProgressUI({
+                    message: 'Loading demo charts…',
+                    percent: null,
+                    detail: '',
+                    indeterminate: true,
+                });
             }
         } catch (e) {
             console.error('S-52 PresLib load failed:', e);
             document.getElementById('map').style.backgroundColor = '#9fc5e8';
             preslibReady = true;
             vectorLayer.changed();
-            if (datasourceReady) tryLoadCharts();
+            const bootShown = await tryBootPreview();
+            if (bootShown) showLoading(false);
+            if (pendingDatasourceResult) {
+                const pending = pendingDatasourceResult;
+                pendingDatasourceResult = null;
+                await finishDatasourceDisplay(pending);
+            } else if (datasourceReady && !datasourceDisplaySettled) {
+                const ds = await fetch('/api/datasource').then(function (r) { return r.json(); });
+                await finishDatasourceDisplay(ds);
+            } else if (datasourceReady) {
+                tryLoadCharts();
+            }
         }
     }
 
@@ -886,20 +2008,148 @@
         if (!legend) return;
         const items = legend.querySelectorAll('.legend-item');
         const swatches = [
-            c('LANDA0'), c('DEPVS0'), c('DEPMS0'), c('DEPMD0'),
-            c('CHYLW0'), c('CHRED0'), c('CHGRN0'), '#000', c('CHGRD0'),
+            c('LANDA'), c('DEPVS'), c('DEPMS'), c('DEPMD'),
+            c('CHYLW'), c('CHRED'), c('CHGRN'), '#000', c('CHGRD'),
         ];
         items.forEach((item, i) => {
             const sw = item.querySelector('.legend-swatch:not(.swatch-circle):not(.swatch-x):not(.swatch-star)');
             if (sw && swatches[i]) sw.style.background = swatches[i];
         });
         const circles = legend.querySelectorAll('.swatch-circle');
-        if (circles[0]) circles[0].style.background = c('CHYLW0');
-        if (circles[1]) circles[1].style.background = c('CHRED0');
-        if (circles[2]) circles[2].style.background = c('CHGRN0');
+        if (circles[0]) circles[0].style.background = c('CHYLW');
+        if (circles[1]) circles[1].style.background = c('CHRED');
+        if (circles[2]) circles[2].style.background = c('CHGRN');
+        const note = document.querySelector('.legend-note');
+        if (note) {
+            const labelMap = {
+                DAY_BRIGHT: 'Day (bright)',
+                DAY_BLACKBACK: 'Day (black background)',
+                DAY_WHITEBACK: 'Day (white background)',
+                DUSK: 'Dusk',
+                NIGHT: 'Night',
+            };
+            note.textContent = `IHO S-52 PresLib (${labelMap[s52.palette] || s52.palette})`;
+        }
     }
 
-    document.getElementById('btn-browse-folder')?.addEventListener('click', browseServerFolder);
+    function refreshAfterPresLibChange() {
+        if (!preslibReady) return;
+        syncViewScaleDenom();
+        document.getElementById('map').style.backgroundColor = s52.getSeaColor();
+        updateLegendColors();
+        lastViewportCacheKey = null;
+        lastStyleResolutionBucket = null;
+        viewportOlCache.clear();
+        vectorLayer.changed();
+    }
+
+    function attachPresLibControls() {
+        const paletteSel = document.getElementById('palette-select');
+        if (paletteSel) {
+            paletteSel.addEventListener('change', () => {
+                s52.setPalette(paletteSel.value);
+                refreshAfterPresLibChange();
+            });
+        }
+        const dispSel = document.getElementById('display-category-select');
+        if (dispSel) {
+            dispSel.addEventListener('change', () => {
+                s52.setDisplayCategory(dispSel.value);
+                refreshAfterPresLibChange();
+            });
+        }
+        const scaminToggle = document.getElementById('toggle-scamin');
+        if (scaminToggle) {
+            scaminToggle.addEventListener('change', () => {
+                s52.setSettings({ respectScamin: scaminToggle.checked });
+                lastViewportCacheKey = null;
+                refreshAfterPresLibChange();
+                scheduleViewportLoad();
+            });
+            s52.setSettings({ respectScamin: scaminToggle.checked });
+        }
+        const twoShades = document.getElementById('toggle-two-shades');
+        if (twoShades) {
+            twoShades.addEventListener('change', () => {
+                s52.setSettings({ twoShades: twoShades.checked });
+                refreshAfterPresLibChange();
+            });
+        }
+        const showSnd = document.getElementById('toggle-soundings');
+        if (showSnd) {
+            showSnd.addEventListener('change', () => {
+                s52.setSettings({ showSoundings: showSnd.checked });
+                refreshAfterPresLibChange();
+            });
+        }
+        const showText = document.getElementById('toggle-show-text');
+        if (showText) {
+            showText.addEventListener('change', () => {
+                s52.setSettings({ showText: showText.checked });
+                refreshAfterPresLibChange();
+            });
+        }
+        const lightDesc = document.getElementById('toggle-light-desc');
+        if (lightDesc) {
+            lightDesc.addEventListener('change', () => {
+                s52.setSettings({ showLightDescriptions: lightDesc.checked });
+                refreshAfterPresLibChange();
+            });
+        }
+        const visibleSectors = document.getElementById('toggle-visible-sectors');
+        if (visibleSectors) {
+            visibleSectors.addEventListener('change', () => {
+                s52.setSettings({ showVisibleSectorLights: visibleSectors.checked });
+                refreshAfterPresLibChange();
+            });
+            s52.setSettings({ showVisibleSectorLights: visibleSectors.checked });
+        }
+        const buoyLabels = document.getElementById('toggle-buoy-labels');
+        if (buoyLabels) {
+            buoyLabels.addEventListener('change', () => {
+                s52.setSettings({ showBuoyLightLabels: buoyLabels.checked });
+                refreshAfterPresLibChange();
+            });
+        }
+        if (dispSel) s52.setDisplayCategory(dispSel.value);
+    }
+
+    document.getElementById('btn-browse-folder')?.addEventListener('click', onBrowseFolderClick);
+    document.getElementById('folder-file-input')?.addEventListener('change', onFolderInputChange);
+
+    const SIDEBAR_VISIBLE_KEY = 's57viewer-sidebar-visible';
+
+    function setSidebarVisible(visible) {
+        const main = document.getElementById('main-container');
+        const toggle = document.getElementById('sidebar-toggle');
+        if (!main) return;
+        main.classList.toggle('sidebar-hidden', !visible);
+        if (toggle) toggle.setAttribute('aria-expanded', visible ? 'true' : 'false');
+        try {
+            localStorage.setItem(SIDEBAR_VISIBLE_KEY, visible ? '1' : '0');
+        } catch (e) { /* ignore */ }
+        requestAnimationFrame(function () {
+            map.updateSize();
+        });
+    }
+
+    (function initSidebarToggle() {
+        const toggle = document.getElementById('sidebar-toggle');
+        const showBtn = document.getElementById('sidebar-show-btn');
+        let visible = true;
+        try {
+            const stored = localStorage.getItem(SIDEBAR_VISIBLE_KEY);
+            if (stored === '0') visible = false;
+        } catch (e) { /* ignore */ }
+        setSidebarVisible(visible);
+        toggle?.addEventListener('click', function () {
+            const isHidden = document.getElementById('main-container')?.classList.contains('sidebar-hidden');
+            setSidebarVisible(isHidden);
+        });
+        showBtn?.addEventListener('click', function () {
+            setSidebarVisible(true);
+        });
+    })();
 
     function loadVisitorStats() {
         fetch('/api/visitors')
@@ -917,31 +2167,32 @@
     map.updateSize();
     window.addEventListener('resize', () => map.updateSize());
 
-    showLoading(true);
+    isFittingView = true;
+    map.getView().fit(
+        ol.proj.transformExtent(KOREA_FOCUS_BOUNDS, 'EPSG:4326', 'EPSG:3857'),
+        { padding: [40, 40, 40, 40], maxZoom: 9, duration: 0 }
+    );
+    isFittingView = false;
+
+    prefetchBootViewport();
+    showLoading(true, 'subtle');
     updateProgressUI({
-        message: 'Starting chart viewer…',
+        message: 'Loading charts…',
         percent: null,
         detail: '',
         indeterminate: true,
     });
 
+    function registerServiceWorker() {
+        if (!('serviceWorker' in navigator)) return;
+        navigator.serviceWorker.register('/sw.js?v=10').catch(function (err) {
+            console.warn('Service worker registration failed:', err);
+        });
+    }
+
     initPreslib();
     ensureDefaultSampleOnConnect();
     loadVisitorStats();
-
-    // Cursor style
-    map.on('pointermove', function (evt) {
-        const hit = map.hasFeatureAtPixel(evt.pixel, { hitTolerance: 5 });
-        map.getTargetElement().style.cursor = hit ? 'pointer' : '';
-    });
-
-    // Zoom change -> update scale select
-    map.getView().on('change:resolution', function () {
-        const zoom = getZoomLevel();
-        updateInfo(
-            parseInt(document.getElementById('info-charts').textContent) || 0,
-            parseInt(document.getElementById('info-features').textContent.replace(/,/g, '')) || 0
-        );
-    });
+    registerServiceWorker();
 
 })();

@@ -4,8 +4,13 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>S-57 Electronic Nautical Chart Viewer</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%230d47a1'/%3E%3Cpath fill='%23FFB300' d='M16 6v20M6 16h20' stroke='%23FFB300' stroke-width='1'/%3E%3Ccircle cx='16' cy='16' r='2' fill='%23FFB300'/%3E%3C/svg%3E">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@10.5.0/ol.css">
     <link rel="stylesheet" href="style.css">
+    <link rel="preload" href="/default-viewport.json?v=1" as="fetch" crossorigin>
+    <link rel="preload" href="/s52-preslib.json?v=9" as="fetch" crossorigin>
+    <link rel="preload" href="/s52-preslib.js?v=11" as="script">
+    <script>try{if(sessionStorage.getItem('s57viewer-admin-mode')==='1')document.documentElement.classList.add('admin-mode');}catch(e){}</script>
 </head>
 <body>
     <header id="top-bar">
@@ -17,21 +22,29 @@
                 <path d="M13 12 Q20 8 27 12 Q30 16 27 20 Q20 24 13 20 Q10 16 13 12Z" fill="#2196F3" opacity="0.6"/>
             </svg>
             <span class="app-title">S-57 Web Viewer</span>
-            <span class="app-version">v0.0.2</span>
+            <span class="app-version">v0.0.3</span>
+            <span class="admin-mode-indicator" id="admin-mode-indicator" aria-hidden="true">Admin</span>
         </a>
         <div class="top-controls">
             <nav class="header-nav-links" aria-label="Main navigation">
-                <a href="/" class="active">Viewer</a>
-                <a href="/docs.html">Documentation</a>
-                <a href="https://docs.google.com/document/d/1duEzdO5jr04jgnnGRqFvlzImcVOBb6LAvQ2Fp5ufr_Q/edit?usp=sharing" target="_blank" rel="noopener noreferrer">Feedback</a>
+                <a href="/docs.html" class="admin-only">Documentation</a>
+                <a href="https://docs.google.com/document/d/1duEzdO5jr04jgnnGRqFvlzImcVOBb6LAvQ2Fp5ufr_Q/edit?usp=sharing" target="_blank" rel="noopener noreferrer" class="admin-only">Feedback</a>
             </nav>
+            <button type="button" id="sidebar-toggle" class="btn-sidebar-toggle" title="Show or hide side panel" aria-expanded="true" aria-controls="sidebar">
+                <svg class="sidebar-toggle-icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                    <rect x="3" y="4" width="7" height="16" rx="1" fill="currentColor"/>
+                    <rect x="12" y="6" width="9" height="3" rx="0.5" fill="currentColor" opacity="0.7"/>
+                    <rect x="12" y="11" width="9" height="3" rx="0.5" fill="currentColor" opacity="0.7"/>
+                    <rect x="12" y="16" width="6" height="3" rx="0.5" fill="currentColor" opacity="0.7"/>
+                </svg>
+                <span class="sidebar-toggle-label">Panel</span>
+            </button>
             <label class="toggle-label">
                 <span>Dual Mode</span>
                 <div class="toggle-switch" id="dual-mode-toggle">
                     <div class="toggle-slider"></div>
                 </div>
             </label>
-            <button class="top-btn" id="btn-disclaimer">Disclaimer</button>
         </div>
     </header>
 
@@ -39,10 +52,23 @@
         <aside id="sidebar">
             <div class="sidebar-section" id="datasource-section">
                 <h3 class="section-title">Chart Data</h3>
-                <button type="button" class="btn-load-folder" id="btn-browse-folder">Select folder</button>
+                <button type="button" class="btn-load-folder" id="btn-browse-folder" title="Select a folder of S-57 .000 files. Shift+click: server folder dialog (local install only).">Select folder</button>
+                <input type="file" id="folder-file-input" class="folder-file-input" webkitdirectory directory multiple hidden>
                 <div id="datasource-status" class="datasource-status" aria-live="polite">
                     <span id="datasource-path" class="datasource-path">Loading demo charts…</span>
                     <span id="datasource-count" class="datasource-count"></span>
+                </div>
+                <div id="load-report-panel" class="load-report-panel hidden" aria-live="polite">
+                    <h4 class="load-report-heading">Folder analysis</h4>
+                    <div id="load-report-summary" class="load-report-summary"></div>
+                    <details id="load-report-details" class="load-report-details">
+                        <summary>Show details</summary>
+                        <div id="load-report-extra" class="load-report-extra"></div>
+                        <details class="load-report-details load-report-details-nested">
+                            <summary>Per-chart list</summary>
+                            <div id="load-report-detail-body" class="load-report-detail-body"></div>
+                        </details>
+                    </details>
                 </div>
             </div>
 
@@ -63,6 +89,49 @@
                 <select id="country-select" class="styled-select">
                     <option value="KR" selected>Republic of Korea</option>
                 </select>
+            </div>
+
+            <div class="sidebar-section admin-only">
+                <h3 class="section-title">S-52 Rendering</h3>
+                <label class="display-option">
+                    <span>Palette</span>
+                    <select id="palette-select" class="styled-select">
+                        <option value="DAY_BRIGHT" selected>Day (bright)</option>
+                        <option value="DAY_BLACKBACK">Day (black back)</option>
+                        <option value="DAY_WHITEBACK">Day (white back)</option>
+                        <option value="DUSK">Dusk</option>
+                        <option value="NIGHT">Night</option>
+                    </select>
+                </label>
+                <label class="display-option">
+                    <span>Display category</span>
+                    <select id="display-category-select" class="styled-select">
+                        <option value="DISPLAYBASE">Base</option>
+                        <option value="STANDARD">Standard</option>
+                        <option value="OTHER" selected>All (Other)</option>
+                    </select>
+                </label>
+                <label class="display-option">
+                    <input type="checkbox" id="toggle-scamin"> Respect SCAMIN scale limits
+                </label>
+                <label class="display-option">
+                    <input type="checkbox" id="toggle-two-shades"> Two-shade depths
+                </label>
+                <label class="display-option">
+                    <input type="checkbox" id="toggle-soundings" checked> Show soundings
+                </label>
+                <label class="display-option">
+                    <input type="checkbox" id="toggle-show-text" checked> Show text
+                </label>
+                <label class="display-option">
+                    <input type="checkbox" id="toggle-light-desc" checked> Light descriptions
+                </label>
+                <label class="display-option">
+                    <input type="checkbox" id="toggle-visible-sectors"> Visible sector lights
+                </label>
+                <label class="display-option">
+                    <input type="checkbox" id="toggle-buoy-labels" checked> Buoy/Light labels
+                </label>
             </div>
 
             <div class="sidebar-section">
@@ -107,6 +176,17 @@
                 </div>
             </div>
 
+            <div class="sidebar-section admin-only" id="view-bookmarks-section">
+                <details class="sidebar-collapsible" id="view-bookmarks-details" open>
+                    <summary class="section-title sidebar-collapsible-summary">View bookmarks</summary>
+                    <div class="sidebar-collapsible-body">
+                        <p class="bookmark-hint">Click <kbd>1</kbd>–<kbd>9</kbd> to save · Press key or double-click to go · Saved in browser</p>
+                        <div id="view-bookmarks-list" class="view-bookmarks-list"></div>
+                        <button type="button" class="btn-bookmark-reset" id="btn-reset-bookmarks">Reset to defaults</button>
+                    </div>
+                </details>
+            </div>
+
             <div class="sidebar-section">
                 <h3 class="section-title">Chart Info</h3>
                 <div id="chart-info">
@@ -122,7 +202,7 @@
                 </details>
             </div>
 
-            <div class="sidebar-section">
+            <div class="sidebar-section admin-only">
                 <h3 class="section-title">Legend</h3>
                 <div id="legend">
                     <div class="legend-item"><span class="legend-swatch"></span> Land (LANDA)</div>
@@ -138,13 +218,13 @@
                 <p class="legend-note">IHO S-52 PresLib e4.0.0 (DAY)</p>
             </div>
 
-            <div class="sidebar-section app-meta">
+            <div class="sidebar-section app-meta admin-only">
                 <h3 class="section-title">About</h3>
                 <div id="app-about" class="app-about">
                     <p><span class="about-label">Author</span> Kim Kilyong</p>
                     <p><span class="about-label">Contact</span> <a href="mailto:ejavm83@gmail.com">ejavm83@gmail.com</a></p>
                     <p><span class="about-label">Affiliation</span> Korea Maritime University</p>
-                    <p><span class="about-label">Version</span> v0.0.2</p>
+                    <p><span class="about-label">Version</span> v0.0.3</p>
                     <p><span class="about-label">Release</span> 17 May 2026</p>
                     <p><span class="about-label">Visitors today</span> <span id="visitor-today">—</span></p>
                     <p><span class="about-label">Total visitors</span> <span id="visitor-total">—</span></p>
@@ -157,6 +237,9 @@
         </aside>
 
         <div id="map-container">
+            <button type="button" id="sidebar-show-btn" class="sidebar-show-btn" title="Show panel" aria-label="Show panel">
+                <span aria-hidden="true">&#8250;</span>
+            </button>
             <div id="map"></div>
             <div id="scale-bar-custom">
                 <select id="scale-select" class="scale-select">
@@ -165,6 +248,7 @@
                     <option value="3500000">1:3,500,000</option>
                     <option value="700000">1:700,000</option>
                     <option value="180000">1:180,000</option>
+                    <option value="111000">1:111,000</option>
                     <option value="90000">1:90,000</option>
                     <option value="22000">1:22,000</option>
                     <option value="12000">1:12,000</option>
@@ -172,6 +256,7 @@
                 <span class="disclaimer-text">This map cannot be used for navigational purposes. Please use this for test only</span>
             </div>
             <div id="mouse-position"></div>
+            <div id="bookmark-toast" class="bookmark-toast" role="status" aria-live="polite"></div>
             <div id="loading-indicator" role="status" aria-live="polite" aria-busy="true">
                 <div class="spinner"></div>
                 <div class="loading-content">
@@ -192,7 +277,9 @@
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/ol@10.5.0/dist/ol.js"></script>
-    <script src="s52-preslib.js"></script>
-    <script src="app.js?v=3"></script>
+    <script src="boot-cache.js?v=10"></script>
+    <script src="s52-preslib.js?v=11"></script>
+    <script src="app.js?v=29"></script>
+    <script src="admin-mode.js"></script>
 </body>
 </html>

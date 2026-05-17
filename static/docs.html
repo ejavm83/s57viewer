@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>S-57 ENC Web Viewer - Documentation</title>
+    <script>try{if(sessionStorage.getItem('s57viewer-admin-mode')==='1')document.documentElement.classList.add('admin-mode');}catch(e){}</script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -74,8 +75,27 @@
             transition: all 0.2s;
         }
 
-        .top-nav .nav-links a:hover { color: var(--text); background: rgba(255,255,255,0.05); }
-        .top-nav .nav-links a.active { color: var(--accent); background: rgba(255,179,0,0.1); }
+        .top-nav .nav-links a:hover,
+        .top-nav .nav-links .nav-admin-toggle:hover { color: var(--text); background: rgba(255,255,255,0.05); }
+        .top-nav .nav-links a.active,
+        .top-nav .nav-links .nav-admin-toggle[aria-pressed="true"] { color: var(--accent); background: rgba(255,179,0,0.1); }
+
+        .top-nav .nav-links .nav-admin-toggle {
+            color: var(--text-muted);
+            font-size: 14px;
+            padding: 6px 12px;
+            border: none;
+            border-radius: 6px;
+            background: transparent;
+            font-family: inherit;
+            font-weight: inherit;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        html:not(.admin-mode) .top-nav .nav-links a.admin-only {
+            display: none;
+        }
 
         /* --- Layout --- */
         .layout {
@@ -449,8 +469,9 @@
     </a>
     <div class="nav-links">
         <a href="/">Viewer</a>
-        <a href="/docs.html" class="active">Documentation</a>
-        <a href="https://docs.google.com/document/d/1duEzdO5jr04jgnnGRqFvlzImcVOBb6LAvQ2Fp5ufr_Q/edit?usp=sharing" target="_blank" rel="noopener noreferrer">Feedback</a>
+        <button type="button" id="admin-mode-toggle" class="nav-admin-toggle" aria-pressed="false" title="Toggle admin features (Shift+F12)">Admin</button>
+        <a href="/docs.html" class="active admin-only">Documentation</a>
+        <a href="https://docs.google.com/document/d/1duEzdO5jr04jgnnGRqFvlzImcVOBb6LAvQ2Fp5ufr_Q/edit?usp=sharing" target="_blank" rel="noopener noreferrer" class="admin-only">Feedback</a>
     </div>
 </nav>
 
@@ -509,7 +530,7 @@
             </div>
             <div class="card">
                 <h4><span class="badge badge-yellow">Version</span></h4>
-                <p>v0.0.2</p>
+                <p>v0.0.3</p>
             </div>
             <div class="card">
                 <h4><span class="badge badge-purple">Release</span></h4>
@@ -934,7 +955,7 @@
 
         <br><br>
         <div class="alert alert-info" style="text-align:center">
-            <strong>S-57 Web Viewer</strong> v0.0.2 &mdash; Author: Kim Kilyong, Korea Maritime University &mdash; Contact: <a href="mailto:ejavm83@gmail.com">ejavm83@gmail.com</a> &mdash; Release: 17 May 2026<br>
+            <strong>S-57 Web Viewer</strong> v0.0.3 &mdash; Author: Kim Kilyong, Korea Maritime University &mdash; Contact: <a href="mailto:ejavm83@gmail.com">ejavm83@gmail.com</a> &mdash; Release: 17 May 2026<br>
             <a href="https://github.com/ejavm83/s57viewer">github.com/ejavm83/s57viewer</a>
         </div>
     </main>
@@ -958,6 +979,7 @@ function updateToc() {
 window.addEventListener('scroll', updateToc);
 updateToc();
 </script>
+<script src="admin-mode.js"></script>
 
 </body>
 </html>

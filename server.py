@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import struct
 import hashlib
 import shutil
@@ -15,12 +16,25 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from starlette.middleware.gzip import GZipMiddleware
 
 import pyogrio
 from pyogrio.raw import read as ogr_read
 
 app = FastAPI()
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+VIEWPORT_PAD_RATIO = 0.08
+MAX_FEATURES_RESPONSE = 100_000
+SOUNDG_MAX_BY_ZOOM: dict[int, int | None] = {
+    9: 2500,
+    10: 6000,
+    11: 15_000,
+    12: 30_000,
+    13: 50_000,
+    14: 80_000,
+}
 
 S57_DIR: Path | None = Path(os.environ["S57_DIR"]) if os.environ.get("S57_DIR") else None
 CACHE_DIR = Path(os.environ.get("CACHE_DIR", Path(__file__).parent / "cache"))
@@ -53,6 +67,16 @@ chart_source_dirs: list[Path] = []
 datasource_mode: str = "default"
 CACHE_DIR.mkdir(exist_ok=True)
 UPLOAD_DIR.mkdir(exist_ok=True)
+VIEWPORT_RESPONSE_DIR = CACHE_DIR / "viewport_responses"
+VIEWPORT_RESPONSE_DIR.mkdir(exist_ok=True)
+_CHARTS_POOL = ThreadPoolExecutor(
+    max_workers=min(8, (os.cpu_count() or 4)),
+    thread_name_prefix="s57charts",
+)
+_LAYER_POOL = ThreadPoolExecutor(
+    max_workers=min(6, (os.cpu_count() or 4)),
+    thread_name_prefix="s57layer",
+)
 
 _datasource_lock = Lock()
 _load_progress_lock = Lock()
@@ -71,18 +95,20 @@ _load_progress: dict = {
 VISITORS_FILE = CACHE_DIR / "visitors.json"
 
 FEATURE_LAYERS = [
-    "DEPARE", "DEPCNT", "LNDARE", "COALNE", "SOUNDG",
-    "LIGHTS", "BOYISD", "BOYLAT", "BOYSAW", "BOYSPP",
-    "BCNCAR", "BCNISD", "BCNLAT",
+    "DEPARE", "DEPCNT", "DRGARE", "LNDARE", "COALNE", "SOUNDG",
+    "LIGHTS", "BOYCAR", "BOYISD", "BOYLAT", "BOYSAW", "BOYSPP",
+    "BCNCAR", "BCNISD", "BCNLAT", "BCNSAW", "BCNSPP",
     "OBSTRN", "UWTROC", "WRECKS",
     "SEAARE", "LAKARE", "BRIDGE", "SLCONS",
     "TOPMAR", "LNDMRK", "LNDELV", "LNDRGN",
-    "FERYRT", "RDOSTA", "PILPNT", "FOGSIG",
+    "FERYRT", "RDOSTA", "PILPNT", "PILBOP", "FOGSIG",
     "CBLOHD", "CBLSUB", "PIPSOL",
-    "MORFAC", "DAMCON", "PONTON", "PYLONS",
-    "ACHBRT", "CTRPNT", "FSHFAC", "MARCUL",
+    "MORFAC", "DAMCON", "PONTON", "HULKES", "PYLONS",
+    "ACHBRT", "ACHARE", "CTRPNT", "FSHFAC", "MARCUL",
     "DWRTPT", "TWRTPT", "RTPBCN", "RDOCAL",
-    "UNSARE", "SBDARE", "WEDKLP",
+    "UNSARE", "SBDARE", "WEDKLP", "BUAARE",
+    "FAIRWY", "RIVERS", "CANALS",
+    "RESARE", "TSSBND", "TSELNE", "ISTZNE", "TSSLPT", "TSSRON",
     "M_COVR", "M_QUAL",
 ]
 
@@ -90,18 +116,26 @@ DISPLAY_CATEGORIES = {
     "depth": ["DEPARE", "DEPCNT", "SBDARE"],
     "sounding": ["SOUNDG"],
     "light": ["LIGHTS", "FOGSIG"],
-    "beacon": ["BCNCAR", "BCNISD", "BCNLAT", "RTPBCN"],
+    "beacon": ["BCNCAR", "BCNISD", "BCNLAT", "RTPBCN", "TOPMAR"],
     "buoy": ["BOYISD", "BOYLAT", "BOYSAW", "BOYSPP"],
     "obstruction": ["OBSTRN", "UWTROC"],
     "wreck": ["WRECKS"],
     "land": ["LNDARE", "LNDMRK", "LNDELV", "LNDRGN", "LAKARE"],
     "coastline": ["COALNE", "SLCONS"],
-    "navigation": ["DWRTPT", "TWRTPT", "FERYRT", "RDOCAL", "RDOSTA", "ACHBRT", "CTRPNT"],
+    "navigation": ["DWRTPT", "TWRTPT", "FERYRT", "RDOCAL", "RDOSTA", "ACHBRT", "CTRPNT",
+                   "PILPNT", "PILBOP", "RESARE", "TSSBND", "TSELNE", "ISTZNE"],
     "infrastructure": ["BRIDGE", "CBLOHD", "CBLSUB", "PIPSOL", "MORFAC", "DAMCON", "PONTON", "PYLONS"],
     "coverage": ["M_COVR", "M_QUAL"],
 }
 
 chart_index: dict = {}
+s52_mariner_settings: dict = {
+    "shallowContour": 2,
+    "safetyContour": 3,
+    "deepContour": 6,
+    "safetyDepth": 3,
+    "source": "default",
+}
 last_load_report: dict | None = None
 
 SCALE_BAND_LABELS = {
@@ -112,6 +146,53 @@ SCALE_BAND_LABELS = {
     5: "1:22,000 (Harbour approach)",
     6: "1:12,000 (Harbour)",
 }
+
+# Nominal display scale denominator per map zoom (matches static/app.js).
+ZOOM_TO_SCALE_DENOM = {
+    4: 50_000_000, 5: 25_000_000, 6: 10_000_000,
+    7: 5_000_000, 8: 3_500_000, 9: 700_000,
+    10: 350_000, 11: 180_000, 12: 90_000,
+    13: 45_000, 14: 22_000, 15: 12_000,
+    16: 6_000, 17: 3_000, 18: 1_500,
+}
+
+# Nominal compilation scale per ENC band (KR1xx = band 1, KR2xx = band 2, …).
+SCALE_BAND_NOMINAL_DENOM = {
+    1: 3_500_000,
+    2: 700_000,
+    3: 180_000,
+    4: 90_000,
+    5: 22_000,
+    6: 12_000,
+}
+
+# Bump when chart quilting / viewport response shape changes (invalidates disk cache).
+CHARTS_API_VERSION = 2
+
+
+def _primary_scale_band_for_zoom(zoom: int) -> int:
+    """Map view zoom to the ENC compilation band that best matches its nominal scale."""
+    denom = ZOOM_TO_SCALE_DENOM.get(zoom, 90_000)
+    best_band = 1
+    best_diff = float("inf")
+    for band, nominal in SCALE_BAND_NOMINAL_DENOM.items():
+        diff = abs(nominal - denom)
+        if diff < best_diff:
+            best_diff = diff
+            best_band = band
+    return best_band
+
+
+def _target_scale_bands_for_zoom(zoom: int) -> list[int]:
+    """ENC quilting: one band coarser through two finer than the view's primary band."""
+    primary = _primary_scale_band_for_zoom(zoom)
+    lo = max(1, primary - 1)
+    hi = min(6, primary + 2)
+    return list(range(lo, hi + 1))
+
+LAYER_CACHE_VERSION = 2
+
+GLOBAL_S57_ATTRS = ("SCAMIN", "SCAMAX", "QUAPOS")
 
 
 class DatasourcePath(BaseModel):
@@ -401,15 +482,17 @@ def datasource_payload() -> dict:
             "summary": last_load_report["summary"],
             "generated_at": last_load_report["generated_at"],
         }
+    payload["s52_settings"] = s52_mariner_settings
     return payload
 
 
-def _pick_folder_dialog() -> str | None:
+def _pick_folder_dialog() -> tuple[str | None, str | None]:
+    """Return (path, cancel_reason). cancel_reason is set when no path was chosen."""
     try:
         import tkinter as tk
         from tkinter import filedialog
     except ImportError:
-        return None
+        return None, "no_dialog"
 
     root = tk.Tk()
     root.withdraw()
@@ -419,7 +502,9 @@ def _pick_folder_dialog() -> str | None:
         pass
     path = filedialog.askdirectory(title="Select ENC folder (S-57 .000 files)")
     root.destroy()
-    return path or None
+    if path:
+        return path, None
+    return None, "cancelled"
 
 
 def _progress_snapshot() -> dict:
@@ -494,6 +579,7 @@ def _load_datasource_worker(root: Path | None, mode: str = "replace") -> None:
         if not chart_files:
             raise ValueError("No .000 chart files found in the configured data source(s).")
 
+        clear_viewport_response_cache()
         chart_index = {}
         build_chart_index(on_progress=_index_progress_callback)
 
@@ -557,6 +643,7 @@ def set_datasource(root: Path, mode: str = "replace") -> dict:
         )
 
     with _datasource_lock:
+        clear_viewport_response_cache()
         chart_index = {}
         build_chart_index()
 
@@ -566,12 +653,14 @@ def set_datasource(root: Path, mode: str = "replace") -> dict:
 def parse_wkb_point(wkb: bytes):
     bo = "<" if wkb[0] == 1 else ">"
     wkb_type = struct.unpack(f"{bo}I", wkb[1:5])[0]
-    if wkb_type == 1:
-        x, y = struct.unpack(f"{bo}dd", wkb[5:21])
-        return {"type": "Point", "coordinates": [round(x, 7), round(y, 7)]}
-    elif wkb_type == 1001:
+    base_type = wkb_type & 0xFF
+    has_z = (wkb_type & 0x80000000) or (wkb_type >= 1000 and wkb_type < 2000)
+    if base_type == 1 and has_z and len(wkb) >= 29:
         x, y, z = struct.unpack(f"{bo}ddd", wkb[5:29])
         return {"type": "Point", "coordinates": [round(x, 7), round(y, 7), round(z, 2)]}
+    elif base_type == 1:
+        x, y = struct.unpack(f"{bo}dd", wkb[5:21])
+        return {"type": "Point", "coordinates": [round(x, 7), round(y, 7)]}
     return None
 
 
@@ -613,11 +702,13 @@ def parse_wkb_multipoint(wkb: bytes):
     for _ in range(n_geoms):
         sub_bo = "<" if wkb[offset] == 1 else ">"
         sub_type = struct.unpack(f"{sub_bo}I", wkb[offset + 1:offset + 5])[0]
-        if sub_type == 1001:
+        sub_base = sub_type & 0xFF
+        has_z = (sub_type & 0x80000000) or (sub_type >= 1000 and sub_type < 2000)
+        if sub_base == 1 and has_z:
             x, y, z = struct.unpack(f"{sub_bo}ddd", wkb[offset + 5:offset + 29])
             points.append([round(x, 7), round(y, 7), round(z, 2)])
             offset += 29
-        elif sub_type == 1:
+        elif sub_base == 1:
             x, y = struct.unpack(f"{sub_bo}dd", wkb[offset + 5:offset + 21])
             points.append([round(x, 7), round(y, 7)])
             offset += 21
@@ -695,6 +786,224 @@ def parse_wkb_multipolygon(wkb: bytes):
     return {"type": "MultiPolygon", "coordinates": polygons}
 
 
+# S-57 line features (cables, pipelines) often store disjoint legs as one vertex chain.
+# Connecting those legs draws long spurious chords; split at large coordinate gaps.
+LINE_VERTEX_GAP_DEG = 0.025
+
+
+def _split_line_coords(coords: list, max_gap_deg: float = LINE_VERTEX_GAP_DEG) -> list[list]:
+    if len(coords) < 2:
+        return []
+    parts: list[list] = []
+    current = [coords[0]]
+    for i in range(1, len(coords)):
+        prev, pt = coords[i - 1], coords[i]
+        gap = math.hypot(pt[0] - prev[0], pt[1] - prev[1])
+        if gap > max_gap_deg and len(current) >= 2:
+            parts.append(current)
+            current = [pt]
+        else:
+            current.append(pt)
+    if len(current) >= 2:
+        parts.append(current)
+    return parts
+
+
+def _normalize_line_geometry(geom: dict | None) -> dict | None:
+    if not geom:
+        return geom
+    gtype = geom.get("type")
+    if gtype == "LineString":
+        parts = _split_line_coords(geom["coordinates"])
+        if len(parts) <= 1:
+            return geom
+        return {"type": "MultiLineString", "coordinates": parts}
+    if gtype == "MultiLineString":
+        parts: list[list] = []
+        for line in geom["coordinates"]:
+            parts.extend(_split_line_coords(line))
+        if not parts:
+            return geom
+        if len(parts) == 1 and len(geom["coordinates"]) == 1:
+            return {"type": "LineString", "coordinates": parts[0]}
+        return {"type": "MultiLineString", "coordinates": parts}
+    return geom
+
+
+def _normalize_attr_value(val):
+    if val is None:
+        return None
+    s = str(val)
+    if s == "" or s == "nan":
+        return None
+    if hasattr(val, "item"):
+        val = val.item()
+        s = str(val)
+        if s == "nan":
+            return None
+        return val
+    if hasattr(val, "__len__") and not isinstance(val, (str, bytes)):
+        try:
+            parts = []
+            for x in val:
+                if x is None or str(x) == "nan":
+                    continue
+                parts.append(str(x.item() if hasattr(x, "item") else x))
+            return ",".join(parts) if parts else None
+        except TypeError:
+            pass
+    return val
+
+
+def compute_s52_settings_from_index() -> dict:
+    """Derive mariner contour settings from indexed chart DEPCNT layers."""
+    contours: list[float] = []
+    for info in chart_index.values():
+        path = info.get("path")
+        if not path:
+            continue
+        try:
+            result = ogr_read(path, layer="DEPCNT")
+            field_names = list(result[0]["fields"])
+            if "VALDCO" not in field_names:
+                continue
+            idx = field_names.index("VALDCO")
+            for raw in result[3][idx]:
+                v = _normalize_attr_value(raw)
+                if v is None:
+                    continue
+                try:
+                    contours.append(float(v))
+                except (TypeError, ValueError):
+                    pass
+        except Exception:
+            continue
+
+    settings = {
+        "shallowContour": 2,
+        "safetyContour": 3,
+        "deepContour": 6,
+        "safetyDepth": 3,
+        "source": "default",
+    }
+    if not contours:
+        return settings
+
+    uniq = sorted({round(c, 2) for c in contours if c >= 0})
+    shallow_candidates = [c for c in uniq if 1 <= c <= 5]
+    safety_candidates = [c for c in uniq if 2 <= c <= 10]
+    deep_candidates = [c for c in uniq if 5 <= c <= 30]
+    if shallow_candidates:
+        settings["shallowContour"] = shallow_candidates[0]
+    if safety_candidates:
+        for c in safety_candidates:
+            if c > settings["shallowContour"]:
+                settings["safetyContour"] = c
+                settings["safetyDepth"] = c
+                break
+    if deep_candidates:
+        for c in deep_candidates:
+            if c > settings["safetyContour"]:
+                settings["deepContour"] = c
+                break
+    settings["source"] = "depcnt"
+    return settings
+
+
+def _write_s52_settings_file(settings: dict) -> None:
+    path = Path(__file__).parent / "static" / "s52-settings.json"
+    try:
+        path.write_text(json.dumps(settings, separators=(",", ":")), encoding="utf-8")
+    except OSError as exc:
+        print(f"Warning: could not write {path.name}: {exc}")
+
+
+def refresh_s52_mariner_settings() -> dict:
+    global s52_mariner_settings
+    s52_mariner_settings = compute_s52_settings_from_index()
+    _write_s52_settings_file(s52_mariner_settings)
+    return s52_mariner_settings
+
+
+def _view_scale_denominator(zoom: int) -> int:
+    return ZOOM_TO_SCALE_DENOM.get(zoom, 90_000)
+
+
+def _passes_scale_limits(props: dict, view_scale_denom: int) -> bool:
+    """Hide objects outside SCAMIN/SCAMAX (IHO S-52 / OpenCPN behaviour)."""
+    raw_min = props.get("SCAMIN")
+    if raw_min is not None and raw_min != "":
+        try:
+            if view_scale_denom > int(float(raw_min)):
+                return False
+        except (TypeError, ValueError):
+            pass
+    raw_max = props.get("SCAMAX")
+    if raw_max is not None and raw_max != "":
+        try:
+            if view_scale_denom < int(float(raw_max)):
+                return False
+        except (TypeError, ValueError):
+            pass
+    return True
+
+
+def _attrs_for_layer(layer: str, field_names: list[str]) -> list[tuple[str, int]]:
+    important_attrs = {
+        "SOUNDG": ["OBJNAM", "NOBJNM"],
+        "LIGHTS": ["COLOUR", "CATLIT", "SECTR1", "SECTR2", "SIGPER", "SIGGRP", "LITCHR", "HEIGHT", "VALNMR", "OBJNAM", "NOBJNM"],
+        "DEPARE": ["DRVAL1", "DRVAL2"],
+        "DEPCNT": ["VALDCO"],
+        "BOYISD": ["COLOUR", "BOYSHP", "OBJNAM", "NOBJNM", "ORIENT"],
+        "BOYLAT": ["COLOUR", "BOYSHP", "CATLAM", "OBJNAM", "NOBJNM", "ORIENT"],
+        "BOYCAR": ["COLOUR", "BOYSHP", "CATCAM", "OBJNAM", "NOBJNM", "ORIENT"],
+        "BOYSAW": ["COLOUR", "BOYSHP", "OBJNAM", "NOBJNM", "ORIENT"],
+        "BOYSPP": ["COLOUR", "BOYSHP", "CATSPM", "OBJNAM", "NOBJNM", "ORIENT"],
+        "BCNCAR": ["COLOUR", "BCNSHP", "CATCAM", "OBJNAM", "NOBJNM", "ORIENT"],
+        "BCNISD": ["COLOUR", "BCNSHP", "OBJNAM", "NOBJNM", "ORIENT"],
+        "BCNLAT": ["COLOUR", "BCNSHP", "CATLAM", "OBJNAM", "NOBJNM", "ORIENT"],
+        "BCNSAW": ["COLOUR", "BCNSHP", "OBJNAM", "NOBJNM", "ORIENT"],
+        "BCNSPP": ["COLOUR", "BCNSHP", "OBJNAM", "NOBJNM", "ORIENT"],
+        "TOPMAR": ["TOPSHP", "COLOUR"],
+        "OBSTRN": ["CATOBS", "VALSOU", "WATLEV", "OBJNAM", "NOBJNM"],
+        "UWTROC": ["VALSOU", "WATLEV", "OBJNAM", "NOBJNM"],
+        "WRECKS": ["CATWRK", "VALSOU", "WATLEV", "OBJNAM", "NOBJNM"],
+        "LNDMRK": ["CATLMK", "CONVIS", "OBJNAM", "NOBJNM"],
+        "LNDARE": ["OBJNAM", "NOBJNM"],
+        "LNDELV": ["ELEVAT", "OBJNAM", "NOBJNM"],
+        "LNDRGN": ["CATLND", "OBJNAM", "NOBJNM"],
+        "SEAARE": ["OBJNAM", "NOBJNM"],
+        "LAKARE": ["OBJNAM", "NOBJNM"],
+        "COALNE": ["CATCOA"],
+        "SLCONS": ["CATSLC", "WATLEV"],
+        "BRIDGE": ["VERCLR", "VERCCL", "VERCOP", "OBJNAM", "NOBJNM"],
+        "RDOCAL": ["OBJNAM", "NOBJNM", "COMCHA", "ORIENT"],
+        "RDOSTA": ["OBJNAM", "NOBJNM"],
+        "RTPBCN": ["OBJNAM", "NOBJNM"],
+        "PILPNT": ["OBJNAM", "NOBJNM"],
+        "RESARE": ["OBJNAM", "NOBJNM", "CATREA", "RESTRN"],
+        "ACHBRT": ["OBJNAM", "NOBJNM"],
+        "ACHARE": ["OBJNAM", "NOBJNM"],
+        "FOGSIG": ["OBJNAM", "NOBJNM"],
+        "BUAARE": ["OBJNAM", "NOBJNM"],
+        "TSELNE": ["OBJNAM", "NOBJNM"],
+        "TSSBND": ["OBJNAM", "NOBJNM"],
+        "TSSLPT": ["OBJNAM", "NOBJNM"],
+        "FAIRWY": ["OBJNAM", "NOBJNM"],
+        "DWRTPT": ["OBJNAM", "NOBJNM"],
+        "TWRTPT": ["OBJNAM", "NOBJNM"],
+    }
+    names = list(important_attrs.get(layer, ["OBJNAM", "NOBJNM"]))
+    for attr in GLOBAL_S57_ATTRS:
+        if attr not in names:
+            names.append(attr)
+    keep: list[tuple[str, int]] = []
+    for attr in names:
+        if attr in field_names:
+            keep.append((attr, field_names.index(attr)))
+    return keep
+
+
 def get_scale_from_filename(filename: str) -> int:
     prefix = filename[:4]
     if prefix.startswith("KR"):
@@ -765,6 +1074,7 @@ def build_chart_index(on_progress=None):
         if on_progress:
             n = len(chart_index)
             on_progress(n, n, f"Loaded {n} chart(s) from cache")
+        refresh_s52_mariner_settings()
         return
 
     print(f"Building chart index from {len(chart_source_dirs)} source(s)…")
@@ -829,6 +1139,7 @@ def build_chart_index(on_progress=None):
     failed_entries.sort(key=lambda x: x["file"])
 
     print(f"Indexed {len(chart_index)} charts ({len(failed_entries)} failed)")
+    refresh_s52_mariner_settings()
     if cache_path:
         with open(cache_path, "w", encoding="utf-8") as f:
             json.dump(chart_index, f)
@@ -853,59 +1164,37 @@ def read_s57_layer(filepath: str, layer: str):
         field_arrays = result[3]
         field_names = list(meta["fields"])
 
-        important_attrs = {
-            "SOUNDG": ["OBJNAM"],
-            "LIGHTS": ["COLOUR", "CATLIT", "SECTR1", "SECTR2", "SIGPER", "SIGGRP", "LITCHR", "HEIGHT", "VALNMR", "OBJNAM"],
-            "DEPARE": ["DRVAL1", "DRVAL2"],
-            "DEPCNT": ["VALDCO"],
-            "BOYISD": ["COLOUR", "BOYSHP", "OBJNAM"],
-            "BOYLAT": ["COLOUR", "BOYSHP", "CATLAM", "OBJNAM"],
-            "BOYSAW": ["COLOUR", "BOYSHP", "OBJNAM"],
-            "BOYSPP": ["COLOUR", "BOYSHP", "CATSPM", "OBJNAM"],
-            "BCNCAR": ["COLOUR", "BCNSHP", "CATCAM", "OBJNAM"],
-            "BCNISD": ["COLOUR", "BCNSHP", "OBJNAM"],
-            "BCNLAT": ["COLOUR", "BCNSHP", "CATLAM", "OBJNAM"],
-            "OBSTRN": ["CATOBS", "VALSOU", "WATLEV", "OBJNAM"],
-            "UWTROC": ["VALSOU", "WATLEV", "OBJNAM"],
-            "WRECKS": ["CATWRK", "VALSOU", "WATLEV", "OBJNAM"],
-            "LNDMRK": ["CATLMK", "CONVIS", "OBJNAM", "NOBJNM"],
-            "LNDARE": ["OBJNAM", "NOBJNM"],
-            "SEAARE": ["OBJNAM", "NOBJNM"],
-            "COALNE": ["CATCOA"],
-            "BRIDGE": ["VERCLR", "VERCCL", "VERCOP", "OBJNAM"],
-        }
-        keep_attrs = important_attrs.get(layer, ["OBJNAM", "NOBJNM"])
-        keep_indices = []
-        for attr in keep_attrs:
-            if attr in field_names:
-                keep_indices.append((attr, field_names.index(attr)))
+        keep_indices = _attrs_for_layer(layer, field_names)
 
         for i, geom_wkb in enumerate(geometries):
             geom = parse_wkb(geom_wkb)
             if geom is None:
                 continue
+            geom = _normalize_line_geometry(geom)
 
             props = {"layer": layer}
             for attr_name, idx in keep_indices:
-                val = field_arrays[idx][i]
-                if val is not None and str(val) != "" and str(val) != "nan":
-                    if hasattr(val, "item"):
-                        val = val.item()
+                val = _normalize_attr_value(field_arrays[idx][i])
+                if val is not None:
                     props[attr_name] = val
 
             if layer == "SOUNDG" and geom["type"] == "MultiPoint":
                 for coord in geom["coordinates"]:
-                    features.append({
+                    pt_feat = {
                         "type": "Feature",
                         "geometry": {"type": "Point", "coordinates": coord},
                         "properties": {**props, "depth": coord[2] if len(coord) > 2 else None},
-                    })
+                    }
+                    _attach_bbox_to_feature(pt_feat)
+                    features.append(pt_feat)
             else:
-                features.append({
+                feat = {
                     "type": "Feature",
                     "geometry": geom,
                     "properties": props,
-                })
+                }
+                _attach_bbox_to_feature(feat)
+                features.append(feat)
     except Exception as e:
         pass
     return features
@@ -923,6 +1212,12 @@ async def startup():
 @app.get("/api/datasource")
 async def get_datasource_status():
     return JSONResponse(datasource_payload())
+
+
+@app.get("/api/s52-settings")
+@app.get("/api/s57-settings")  # legacy typo in older clients
+async def get_s52_settings():
+    return JSONResponse(s52_mariner_settings)
 
 
 @app.get("/api/datasource/samples")
@@ -996,9 +1291,12 @@ async def set_datasource_path(body: DatasourcePath):
 @app.post("/api/datasource/browse")
 async def browse_datasource_folder(mode: str = Query("replace")):
     loop = asyncio.get_event_loop()
-    path = await loop.run_in_executor(None, _pick_folder_dialog)
+    path, cancel_reason = await loop.run_in_executor(None, _pick_folder_dialog)
     if not path:
-        return JSONResponse({"cancelled": True})
+        payload: dict = {"cancelled": True}
+        if cancel_reason:
+            payload["reason"] = cancel_reason
+        return JSONResponse(payload)
     load_mode = _normalize_load_mode(mode)
     _start_datasource_load(Path(path), mode=load_mode)
     return JSONResponse({"status": "started", "path": path, "mode": load_mode})
@@ -1057,6 +1355,194 @@ async def upload_datasource(
     })
 
 
+def clear_viewport_response_cache() -> None:
+    if VIEWPORT_RESPONSE_DIR.exists():
+        shutil.rmtree(VIEWPORT_RESPONSE_DIR, ignore_errors=True)
+    VIEWPORT_RESPONSE_DIR.mkdir(exist_ok=True)
+
+
+def _charts_response_cache_key(
+    west: float, south: float, east: float, north: float, zoom: int, layers: str,
+    apply_scamin: bool = False,
+) -> str:
+    rounded = (
+        CHARTS_API_VERSION,
+        round(west, 3), round(south, 3), round(east, 3), round(north, 3),
+        zoom, layers, int(apply_scamin),
+    )
+    return hashlib.sha256(repr(rounded).encode()).hexdigest()[:32]
+
+
+def _attach_bbox_to_feature(feature: dict) -> None:
+    if feature.get("bbox"):
+        return
+    geom = feature.get("geometry")
+    if not geom:
+        return
+    bbox = _coords_bbox(geom["coordinates"], geom["type"])
+    if bbox is not None:
+        feature["bbox"] = [bbox[0], bbox[1], bbox[2], bbox[3]]
+
+
+def _ensure_layer_features_bbox(features: list[dict]) -> bool:
+    if not features or features[0].get("bbox"):
+        return False
+    for feature in features:
+        _attach_bbox_to_feature(feature)
+    return True
+
+
+def _load_layer_features(chart_path: str, layer: str) -> list[dict]:
+    cache_key = hashlib.md5(f"{chart_path}:{layer}:v{LAYER_CACHE_VERSION}".encode()).hexdigest()
+    cache_file = CACHE_DIR / f"{cache_key}.json"
+    if cache_file.exists():
+        with open(cache_file, "r", encoding="utf-8") as f:
+            features = json.load(f)
+        if _ensure_layer_features_bbox(features):
+            try:
+                with open(cache_file, "w", encoding="utf-8") as f:
+                    json.dump(features, f)
+            except OSError:
+                pass
+        return features
+    features = read_s57_layer(chart_path, layer)
+    with open(cache_file, "w", encoding="utf-8") as f:
+        json.dump(features, f)
+    return features
+
+
+def _public_features(features: list[dict]) -> list[dict]:
+    out = []
+    for feature in features:
+        if "bbox" in feature:
+            public = {k: v for k, v in feature.items() if k != "bbox"}
+            out.append(public)
+        else:
+            out.append(feature)
+    return out
+
+
+def _padded_viewport(west: float, south: float, east: float, north: float) -> tuple[float, float, float, float]:
+    lon_pad = (east - west) * VIEWPORT_PAD_RATIO
+    lat_pad = (north - south) * VIEWPORT_PAD_RATIO
+    return west - lon_pad, south - lat_pad, east + lon_pad, north + lat_pad
+
+
+def _bbox_intersects(
+    a_west: float, a_south: float, a_east: float, a_north: float,
+    b_west: float, b_south: float, b_east: float, b_north: float,
+) -> bool:
+    return not (a_east < b_west or a_west > b_east or a_north < b_south or a_south > b_north)
+
+
+def _update_bbox(
+    west: float, south: float, east: float, north: float,
+    lon: float, lat: float,
+) -> tuple[float, float, float, float]:
+    return min(west, lon), min(south, lat), max(east, lon), max(north, lat)
+
+
+def _coords_bbox(coords, geom_type: str) -> tuple[float, float, float, float] | None:
+    try:
+        if geom_type == "Point":
+            return _update_bbox(float("inf"), float("inf"), float("-inf"), float("-inf"), coords[0], coords[1])
+
+        if geom_type in ("LineString", "MultiPoint"):
+            west = south = float("inf")
+            east = north = float("-inf")
+            for pt in coords:
+                west, south, east, north = _update_bbox(west, south, east, north, pt[0], pt[1])
+            return west, south, east, north
+
+        if geom_type == "Polygon":
+            west = south = float("inf")
+            east = north = float("-inf")
+            for ring in coords:
+                for pt in ring:
+                    west, south, east, north = _update_bbox(west, south, east, north, pt[0], pt[1])
+            return west, south, east, north
+
+        if geom_type == "MultiLineString":
+            west = south = float("inf")
+            east = north = float("-inf")
+            for line in coords:
+                for pt in line:
+                    west, south, east, north = _update_bbox(west, south, east, north, pt[0], pt[1])
+            return west, south, east, north
+
+        if geom_type == "MultiPolygon":
+            west = south = float("inf")
+            east = north = float("-inf")
+            for poly in coords:
+                for ring in poly:
+                    for pt in ring:
+                        west, south, east, north = _update_bbox(west, south, east, north, pt[0], pt[1])
+            return west, south, east, north
+    except (IndexError, TypeError, ValueError):
+        return None
+
+    return None
+
+
+def _feature_intersects_viewport(feature: dict, vp: tuple[float, float, float, float]) -> bool:
+    cached = feature.get("bbox")
+    if cached and len(cached) == 4:
+        return _bbox_intersects(
+            cached[0], cached[1], cached[2], cached[3], vp[0], vp[1], vp[2], vp[3],
+        )
+    geom = feature.get("geometry")
+    if not geom:
+        return False
+    bbox = _coords_bbox(geom["coordinates"], geom["type"])
+    if bbox is None:
+        return False
+    return _bbox_intersects(bbox[0], bbox[1], bbox[2], bbox[3], vp[0], vp[1], vp[2], vp[3])
+
+
+def _layers_skipped_at_zoom(zoom: int) -> set[str]:
+    skip: set[str] = set()
+    if zoom <= 6:
+        skip.add("SOUNDG")
+    if zoom <= 5:
+        skip.add("DEPCNT")
+    return skip
+
+
+def _sounding_cap(zoom: int) -> int | None:
+    if zoom <= 8:
+        return 0
+    if zoom >= 14:
+        return None
+    return SOUNDG_MAX_BY_ZOOM.get(zoom)
+
+
+def _filter_features_for_viewport(
+    features: list[dict],
+    vp: tuple[float, float, float, float],
+    layer: str,
+    zoom: int,
+    view_scale_denom: int | None = None,
+    apply_scamin: bool = False,
+) -> list[dict]:
+    scale_denom = view_scale_denom if view_scale_denom is not None else _view_scale_denominator(zoom)
+    filtered = []
+    for f in features:
+        if not _feature_intersects_viewport(f, vp):
+            continue
+        if apply_scamin and not _passes_scale_limits(f.get("properties") or {}, scale_denom):
+            continue
+        filtered.append(f)
+    if layer != "SOUNDG":
+        return filtered
+    cap = _sounding_cap(zoom)
+    if cap is None or len(filtered) <= cap:
+        return filtered
+    if cap <= 0:
+        return []
+    step = max(1, len(filtered) // cap)
+    return filtered[::step][:cap]
+
+
 @app.get("/api/index")
 async def get_index():
     summaries = []
@@ -1070,30 +1556,127 @@ async def get_index():
     return JSONResponse(summaries)
 
 
-@app.get("/api/charts")
-async def get_charts(
-    west: float = Query(...),
-    south: float = Query(...),
-    east: float = Query(...),
-    north: float = Query(...),
-    zoom: int = Query(5),
-    layers: str = Query(""),
-):
-    if zoom <= 5:
-        target_scales = [1, 2]
-    elif zoom <= 7:
-        target_scales = [1, 2, 3]
-    elif zoom <= 9:
-        target_scales = [2, 3, 4]
-    elif zoom <= 11:
-        target_scales = [3, 4, 5]
-    elif zoom <= 13:
-        target_scales = [4, 5, 6]
+def _collect_chart_viewport_features(
+    chart_name: str,
+    chart: dict,
+    vp: tuple[float, float, float, float],
+    zoom: int,
+    requested_layers: list[str] | None,
+    skipped_layers: set[str],
+    apply_scamin: bool = False,
+) -> tuple[list[dict], dict, dict[str, int], int]:
+    try:
+        return _collect_chart_viewport_features_impl(
+            chart_name, chart, vp, zoom, requested_layers, skipped_layers, apply_scamin,
+        )
+    except Exception as exc:
+        print(f"Warning: viewport load failed for {chart_name}: {exc}")
+        return [], {
+            "name": chart_name,
+            "file": _chart_display_name(chart_name),
+            "scale": chart.get("scale"),
+            "scale_label": SCALE_BAND_LABELS.get(chart.get("scale"), ""),
+            "features": 0,
+            "layers_used": 0,
+            "error": str(exc),
+        }, {}, 0
+
+
+def _load_chart_layer_viewport(
+    chart_path: str,
+    layer: str,
+    vp: tuple[float, float, float, float],
+    zoom: int,
+    apply_scamin: bool,
+) -> tuple[str, list[dict], int]:
+    layer_features = _load_layer_features(chart_path, layer)
+    raw_count = len(layer_features)
+    filtered = _filter_features_for_viewport(
+        layer_features, vp, layer, zoom,
+        view_scale_denom=_view_scale_denominator(zoom),
+        apply_scamin=apply_scamin,
+    )
+    return layer, filtered, raw_count
+
+
+def _collect_chart_viewport_features_impl(
+    chart_name: str,
+    chart: dict,
+    vp: tuple[float, float, float, float],
+    zoom: int,
+    requested_layers: list[str] | None,
+    skipped_layers: set[str],
+    apply_scamin: bool = False,
+) -> tuple[list[dict], dict, dict[str, int], int]:
+    chart_features = 0
+    features_by_layer: dict[str, int] = {}
+    collected: list[dict] = []
+    raw_count = 0
+
+    layers_to_load = [
+        layer for layer in chart["layers"]
+        if layer not in skipped_layers
+        and (not requested_layers or layer in requested_layers)
+    ]
+
+    if len(layers_to_load) <= 2:
+        layer_results = [
+            _load_chart_layer_viewport(chart["path"], layer, vp, zoom, apply_scamin)
+            for layer in layers_to_load
+        ]
     else:
-        target_scales = [5, 6]
+        futures = [
+            _LAYER_POOL.submit(
+                _load_chart_layer_viewport, chart["path"], layer, vp, zoom, apply_scamin,
+            )
+            for layer in layers_to_load
+        ]
+        layer_results = [future.result() for future in futures]
+
+    for layer, filtered, layer_raw in layer_results:
+        raw_count += layer_raw
+        n = len(filtered)
+        chart_features += n
+        features_by_layer[layer] = features_by_layer.get(layer, 0) + n
+        collected.extend(filtered)
+
+    detail = {
+        "name": chart_name,
+        "file": _chart_display_name(chart_name),
+        "scale": chart["scale"],
+        "scale_label": SCALE_BAND_LABELS.get(chart["scale"], f"Band {chart['scale']}"),
+        "features": chart_features,
+        "layers_used": len([
+            l for l in chart["layers"]
+            if l not in skipped_layers and (not requested_layers or l in requested_layers)
+        ]),
+    }
+    return collected, detail, features_by_layer, raw_count
+
+
+def _build_charts_response(
+    west: float,
+    south: float,
+    east: float,
+    north: float,
+    zoom: int,
+    layers: str,
+    apply_scamin: bool = False,
+) -> dict:
+    target_scales = _target_scale_bands_for_zoom(zoom)
+
+    if chart_index:
+        available_scales = set()
+        for name, info in chart_index.items():
+            b = info["bounds"]
+            if b[2] < west or b[0] > east or b[3] < south or b[1] > north:
+                continue
+            available_scales.add(info["scale"])
+        if available_scales and not available_scales.intersection(target_scales):
+            target_scales = sorted(available_scales)
 
     if not chart_index:
-        return JSONResponse({
+        return {
             "type": "FeatureCollection",
             "features": [],
             "meta": {
@@ -1103,7 +1686,7 @@ async def get_charts(
                 "zoom": zoom,
                 "target_scales": target_scales,
             },
-        })
+        }
 
     requested_layers = [l.strip() for l in layers.split(",") if l.strip()] if layers else None
 
@@ -1119,68 +1702,121 @@ async def get_charts(
     matching_charts.sort(key=lambda item: item[1]["scale"])
     charts_matched = len(matching_charts)
 
-    max_charts = 30
+    max_charts = 50
     loaded_charts = matching_charts[:max_charts]
+    vp = _padded_viewport(west, south, east, north)
+    skipped_layers = _layers_skipped_at_zoom(zoom)
 
-    all_features = []
+    all_features: list[dict] = []
     features_by_layer: dict[str, int] = {}
     chart_details = []
-    for chart_name, chart in loaded_charts:
-        chart_features = 0
-        for layer in chart["layers"]:
-            if requested_layers and layer not in requested_layers:
-                continue
+    features_capped = False
+    raw_feature_count = 0
 
-            cache_key = hashlib.md5(f"{chart['path']}:{layer}".encode()).hexdigest()
-            cache_file = CACHE_DIR / f"{cache_key}.json"
+    if len(loaded_charts) <= 1:
+        chart_results = [
+            _collect_chart_viewport_features(
+                chart_name, chart, vp, zoom, requested_layers, skipped_layers, apply_scamin,
+            )
+            for chart_name, chart in loaded_charts
+        ]
+    else:
+        futures = [
+            _CHARTS_POOL.submit(
+                _collect_chart_viewport_features,
+                chart_name, chart, vp, zoom, requested_layers, skipped_layers, apply_scamin,
+            )
+            for chart_name, chart in loaded_charts
+        ]
+        chart_results = [future.result() for future in futures]
 
-            if cache_file.exists():
-                with open(cache_file, "r") as f:
-                    features = json.load(f)
-            else:
-                features = read_s57_layer(chart["path"], layer)
-                with open(cache_file, "w") as f:
-                    json.dump(features, f)
+    for collected, detail, by_layer, raw_count in chart_results:
+        raw_feature_count += raw_count
+        remaining = MAX_FEATURES_RESPONSE - len(all_features)
+        if remaining <= 0:
+            features_capped = True
+            chart_details.append(detail)
+            break
+        if len(collected) > remaining:
+            collected = collected[:remaining]
+            features_capped = True
 
-            n = len(features)
-            chart_features += n
-            features_by_layer[layer] = features_by_layer.get(layer, 0) + n
-            all_features.extend(features)
-
-        chart_details.append({
-            "name": chart_name,
-            "file": _chart_display_name(chart_name),
-            "scale": chart["scale"],
-            "scale_label": SCALE_BAND_LABELS.get(chart["scale"], f"Band {chart['scale']}"),
-            "features": chart_features,
-            "layers_used": len([
-                l for l in chart["layers"]
-                if not requested_layers or l in requested_layers
-            ]),
-        })
+        all_features.extend(collected)
+        for layer, count in by_layer.items():
+            features_by_layer[layer] = features_by_layer.get(layer, 0) + count
+        chart_details.append(detail)
+        if features_capped:
+            break
 
     layer_breakdown = [
         {"layer": layer, "features": count}
         for layer, count in sorted(features_by_layer.items(), key=lambda x: (-x[1], x[0]))
     ]
 
-    return JSONResponse({
+    return {
         "type": "FeatureCollection",
-        "features": all_features,
+        "features": _public_features(all_features),
         "meta": {
-            "charts_loaded": len(loaded_charts),
+            "charts_loaded": len(chart_details),
             "charts_matched": charts_matched,
             "charts_capped": charts_matched > max_charts,
             "max_charts": max_charts,
             "total_features": len(all_features),
+            "raw_features_before_viewport": raw_feature_count,
+            "features_capped": features_capped,
+            "max_features": MAX_FEATURES_RESPONSE,
+            "skipped_layers": sorted(skipped_layers),
             "zoom": zoom,
             "target_scales": target_scales,
             "target_scale_labels": [SCALE_BAND_LABELS.get(s, str(s)) for s in target_scales],
+            "apply_scamin": apply_scamin,
             "viewport": {"west": west, "south": south, "east": east, "north": north},
             "charts": chart_details,
             "features_by_layer": layer_breakdown[:20],
-        }
-    })
+            "s52_settings": s52_mariner_settings,
+        },
+    }
+
+
+@app.get("/api/charts")
+async def get_charts(
+    west: float = Query(...),
+    south: float = Query(...),
+    east: float = Query(...),
+    north: float = Query(...),
+    zoom: int = Query(5),
+    layers: str = Query(""),
+    scamin: int = Query(0, ge=0, le=1),
+):
+    apply_scamin = bool(scamin)
+    cache_key = _charts_response_cache_key(west, south, east, north, zoom, layers, apply_scamin)
+    cache_file = VIEWPORT_RESPONSE_DIR / f"{cache_key}.json"
+    if cache_file.exists():
+        try:
+            return FileResponse(cache_file, media_type="application/json")
+        except OSError:
+            pass
+
+    try:
+        payload = await asyncio.to_thread(
+            _build_charts_response, west, south, east, north, zoom, layers, apply_scamin,
+        )
+    except Exception as exc:
+        print(f"Error building charts response: {exc}")
+        raise HTTPException(status_code=500, detail=f"Chart load failed: {exc}") from exc
+
+    tmp_file = cache_file.with_suffix(".json.tmp")
+    try:
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, separators=(",", ":"))
+        tmp_file.replace(cache_file)
+    except OSError:
+        if tmp_file.exists():
+            try:
+                tmp_file.unlink()
+            except OSError:
+                pass
+    return JSONResponse(payload)
 
 
 @app.get("/api/chart/{chart_name}")

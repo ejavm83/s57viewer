@@ -1,5 +1,21 @@
 /**
- * IHO S-52 Presentation Library renderer (PresLib e4.0.0 DAY palette).
+ * IHO S-52 Presentation Library renderer.
+ *
+ * Consumes the bundle produced by `scripts/build_preslib.py` (extracted from
+ * OpenCPN `chartsymbols.xml`) and turns S-57 features into OpenLayers styles
+ * by evaluating the standard PresLib instruction set:
+ *
+ *   AC(color)               – fill an area with a flat color
+ *   AP(pattern[,rotation])  – tile an area with a vector or raster pattern
+ *   LS(style,width,color)   – stroke a line (SOLD/DASH/DOTT)
+ *   LC(line-symbol)         – stroke a line with a repeating vector symbol
+ *   SY(symbol[,rotation])   – place a point symbol (raster atlas + HPGL)
+ *   TE/TX(...)              – textual labels
+ *   CS(procedure)           – conditional symbology procedure (CSP)
+ *
+ * Display category (DISPLAYBASE / STANDARD / OTHER / MARINERS), display
+ * priority (Area/Hazards/Symbols), and the active color palette are all
+ * honoured according to IHO S-52 §4–§9 and §13.
  */
 (function (global) {
     'use strict';
@@ -10,341 +26,1426 @@
         Polygon: 'A', MultiPolygon: 'A',
     };
 
-    const DEFAULT_SETTINGS = {
-        safetyContour: 30,
-        shallowContour: 10,
-        deepContour: 30,
-        safetyDepth: 30,
+    const DISPLAY_CATEGORY_RANK = {
+        DISPLAYBASE: 0, STANDARD: 1, OTHER: 2, MARINERS: 3,
     };
 
-    const LINE_DASH = { SOLD: null, DASH: [8, 4], DOTT: [2, 3] };
+    const DEFAULT_SETTINGS = {
+        safetyContour: 10,
+        shallowContour: 2,
+        deepContour: 30,
+        safetyDepth: 10,
+        twoShades: false,
+        showLowAccuracy: true,
+        respectScamin: false,
+        showSoundings: true,
+        showText: true,
+        showLightDescriptions: true,
+        showBuoyLightLabels: true,
+        showVisibleSectorLights: false,
+        imperialLightText: true,
+    };
 
-    /** Point layers that are label/meta only — never draw default dots. */
-    const HIDDEN_POINT_LAYERS = new Set([
-        'LNDRGN', 'LNDELV', 'M_COVR', 'M_QUAL', 'SEAARE', 'SBDARE', 'UNSARE',
-    ]);
+    const LINE_DASH = { SOLD: null, DASH: [8, 4], DOTT: [2, 4] };
+    const NM_METERS = 1852;
+    const MM_PER_INCH = 25.4;
+    const DEFAULT_DPI = 96;
+    const SYMBOL_SCALE_MM = 4.5;
+
+    /** Layers whose geometry should never produce a point symbol on its own. */
+    const HIDDEN_POINT_LAYERS = new Set(['M_COVR', 'M_QUAL', 'SBDARE', 'UNSARE']);
+
+    /** Fallback when no LUPT rule matches (OpenCPN DISPLAYBASE colours). */
+    const LAYER_DEFAULTS = {
+        LNDARE: { fill: 'LANDA', stroke: 'CSTLN', strokeWidth: 0.6 },
+        LAKARE: { fill: 'DEPVS', stroke: 'CHBLK', strokeWidth: 0.6 },
+        SEAARE: { fill: 'DEPDW', stroke: null },
+        UNSARE: { fill: 'DEPVS', stroke: 'CSTLN', strokeWidth: 0.5, lineDash: [4, 4] },
+        SBDARE: { fill: 'DEPVS', stroke: 'CSTLN', strokeWidth: 0.5 },
+        COALNE: { stroke: 'CSTLN', strokeWidth: 1, lineDash: [8, 4] },
+        SLCONS: { stroke: 'CSTLN', strokeWidth: 2 },
+        DEPCNT: { stroke: 'DEPCN', strokeWidth: 0.6 },
+        TSELNE: { stroke: 'TRFCF', strokeWidth: 2 },
+        TSSBND: { stroke: 'TRFCD', strokeWidth: 1.5, lineDash: [8, 4] },
+        FAIRWY: { stroke: 'CHGRD', strokeWidth: 1, lineDash: [8, 4] },
+        BUAARE: { fill: 'CHBRN', stroke: 'LANDF', strokeWidth: 1 },
+        RIVERS: { fill: 'DEPVS', stroke: 'CHBLK', strokeWidth: 0.6 },
+        CANALS: { fill: 'DEPVS', stroke: 'CHBLK', strokeWidth: 0.6 },
+        ACHBRT: { fill: 'CHMGF', stroke: 'CHMGF', strokeWidth: 2, fillAlpha: 0.15, lineDash: [8, 4] },
+        RESARE: { fill: 'TRFCF', stroke: 'TRFCD', strokeWidth: 1, fillAlpha: 0.18, lineDash: [8, 4] },
+        DRGARE: { fill: 'DEPMD', stroke: 'CHGRF', strokeWidth: 1, lineDash: [8, 4] },
+    };
+
+    function lsWidthPx(mm) {
+        return Math.min(3, Math.max(0.5, (Number(mm) || 1) * (DEFAULT_DPI / MM_PER_INCH) * 0.35));
+    }
+
+    const NO_LC_LAYERS = new Set(['COALNE', 'SLCONS', 'DEPCNT', 'TSELNE', 'TSSBND', 'LNDARE', 'M_COVR']);
+    const LIGHT_AREA_PATTERN_LAYERS = new Set(['OBSTRN', 'UWTROC', 'WRECKS', 'DRGARE']);
+
+    function clamp(v, lo, hi) { return Math.min(Math.max(v, lo), hi); }
+
+    /** Bucket map resolution for style caching (smooth wheel zoom reuses styles). */
+    function styleResolutionBucket(resolution) {
+        if (!Number.isFinite(resolution) || resolution <= 0) return 1;
+        return Math.max(1, Math.round(resolution / 75) * 75);
+    }
+
+    const STYLE_CACHE_MAX = 12000;
+
+    function num(v) {
+        if (v == null || v === '') return NaN;
+        const n = Number(v);
+        return Number.isFinite(n) ? n : NaN;
+    }
+
+    function parseColourList(props) {
+        const raw = props.COLOUR;
+        if (raw == null || raw === '') return [];
+        return String(raw).split(/[,;]/).map(s => Number(s.trim())).filter(n => Number.isFinite(n));
+    }
 
     function withAlpha(hex, alpha) {
-        if (!hex || !hex.startsWith('#') || hex.length < 7) return hex;
+        if (!hex || hex[0] !== '#' || hex.length < 7) return hex;
         const r = parseInt(hex.slice(1, 3), 16);
         const g = parseInt(hex.slice(3, 5), 16);
         const b = parseInt(hex.slice(5, 7), 16);
         return `rgba(${r},${g},${b},${alpha})`;
     }
 
+    /**
+     * HPGL is the vector format used by OpenCPN PresLib glyphs.  This is a
+     * minimal interpreter covering the subset emitted by `chartsymbols.xml`:
+     *   SPx        – select pen / colour index (mapped through color-ref)
+     *   SWx        – set line width (in 1/100 mm; we map to pixels)
+     *   PUx,y      – pen up move to (x,y)
+     *   PDx,y[,..] – pen down line(s) to (x,y) ...
+     *   CIr        – draw a circle (radius r) centred on current pen
+     *   PMx        – polygon mode (0 begin, 1 close, 2 close + fill)
+     *   FP/EP      – fill / edge polygon
+     */
+    function parseHpgl(text) {
+        const cmds = [];
+        if (!text) return cmds;
+        const tokens = text.split(';');
+        for (let raw of tokens) {
+            raw = raw.trim();
+            if (!raw) continue;
+            const m = raw.match(/^([A-Z]{2})(.*)$/);
+            if (!m) continue;
+            const op = m[1];
+            const rest = m[2].trim();
+            const nums = rest ? rest.split(',').map(s => Number(s.trim())).filter(v => !Number.isNaN(v)) : [];
+            cmds.push({ op, raw: rest, nums });
+        }
+        return cmds;
+    }
+
+    /** Resolve `color-ref` strings such as "ACHMGD" or "ACHMGFCCHMGD". */
+    function parseColorRef(ref) {
+        const mapping = {};
+        if (!ref) return mapping;
+        for (let i = 0; i + 6 <= ref.length; i += 6) {
+            const sp = ref[i];
+            const token = ref.slice(i + 1, i + 6);
+            mapping[sp] = token;
+        }
+        return mapping;
+    }
+
+    /**
+     * Render HPGL onto a 2D canvas context.  Coordinates are in PresLib
+     * "S-52 units" (1/100 mm).  The caller supplies a transform mapping
+     * those units onto destination pixels.
+     */
+    function renderHpgl(cmds, ctx, opts) {
+        const { scale, originX, originY, baseLineWidth, resolveColor, defaultColor } = opts;
+        ctx.save();
+        ctx.translate(-originX * scale, -originY * scale);
+        ctx.scale(scale, scale);
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.strokeStyle = defaultColor;
+        ctx.fillStyle = defaultColor;
+        ctx.lineWidth = baseLineWidth;
+
+        let polyOpen = false;
+        let path = new Path2D();
+        let cur = [0, 0];
+
+        const flush = (closePath, fill) => {
+            if (closePath) path.closePath();
+            if (fill) ctx.fill(path);
+            ctx.stroke(path);
+            path = new Path2D();
+        };
+
+        for (const { op, nums } of cmds) {
+            switch (op) {
+                case 'SP': {
+                    const idx = nums.length ? String.fromCharCode('A'.charCodeAt(0) + nums[0]) : 'A';
+                    const c = resolveColor(idx);
+                    if (c) { ctx.strokeStyle = c; ctx.fillStyle = c; }
+                    break;
+                }
+                case 'SW': {
+                    const w = nums.length ? Math.max(1, nums[0]) : 1;
+                    ctx.lineWidth = baseLineWidth * w;
+                    break;
+                }
+                case 'PU': {
+                    for (let i = 0; i + 1 < nums.length; i += 2) {
+                        cur = [nums[i], nums[i + 1]];
+                        path.moveTo(cur[0], cur[1]);
+                    }
+                    break;
+                }
+                case 'PD': {
+                    if (!nums.length) break;
+                    for (let i = 0; i + 1 < nums.length; i += 2) {
+                        cur = [nums[i], nums[i + 1]];
+                        path.lineTo(cur[0], cur[1]);
+                    }
+                    break;
+                }
+                case 'CI': {
+                    const r = nums.length ? nums[0] : 0;
+                    if (r > 0) {
+                        path.moveTo(cur[0] + r, cur[1]);
+                        path.arc(cur[0], cur[1], r, 0, Math.PI * 2);
+                    }
+                    break;
+                }
+                case 'PM': {
+                    polyOpen = nums.length ? nums[0] === 0 : false;
+                    if (nums.length && nums[0] === 1) flush(true, false);
+                    if (nums.length && nums[0] === 2) flush(true, true);
+                    break;
+                }
+                case 'FP': flush(true, true); break;
+                case 'EP': flush(false, false); break;
+                default: break;
+            }
+        }
+        if (polyOpen) flush(false, false);
+        else flush(false, false);
+        ctx.restore();
+    }
+
     class S52PresLib {
         constructor() {
+            this.bundle = null;
+            this.palette = 'DAY_BRIGHT';
             this.colors = {};
             this.lookups = {};
+            this.symbols = {};
+            this.patterns = {};
+            this.lineStyles = {};
+            this.spriteUrl = '/s57data/rastersymbols-day.png';
+            this.spriteSources = {};
+            this.sprites = {};
             this.ready = false;
+            this.displayCategory = 'STANDARD';
+            this.viewScaleDenom = 90_000;
             this.settings = { ...DEFAULT_SETTINGS };
+
             this._styleCache = {};
+            this._styleCacheKeys = [];
+            this._symbolCache = new Map();
+            this._patternCache = new Map();
+        }
+
+        clearStyleCache() {
+            this._styleCache = {};
+            this._styleCacheKeys = [];
+        }
+
+        _rememberStyle(cacheKey, result) {
+            if (this._styleCache[cacheKey] !== undefined) {
+                this._styleCache[cacheKey] = result;
+                return;
+            }
+            this._styleCacheKeys.push(cacheKey);
+            this._styleCache[cacheKey] = result;
+            if (this._styleCacheKeys.length > STYLE_CACHE_MAX) {
+                const evict = this._styleCacheKeys.shift();
+                delete this._styleCache[evict];
+            }
         }
 
         async load(url) {
             const resp = await fetch(url || '/s52-preslib.json');
             if (!resp.ok) throw new Error('S-52 presentation library load failed');
             const data = await resp.json();
-            this.colors = data.colors || {};
+            this.bundle = data;
             this.lookups = data.lookups || {};
-            this.version = data.version;
+            this.symbols = data.symbols || {};
+            this.patterns = data.patterns || {};
+            this.lineStyles = data.line_styles || {};
+            this.spriteSources = data.palette_sprites || {};
+            this.setPalette(data.default_palette || 'DAY_BRIGHT');
             this.ready = true;
-            this._styleCache = {};
+            await this._loadSprite(this.palette);
             return data;
         }
 
-        color(token) {
-            if (!token) return '#000000';
-            if (token.startsWith('#')) return token;
-            return this.colors[token] || this.colors[token + '0'] || '#888888';
+        async _loadSprite(palette) {
+            const src = this.spriteSources[palette];
+            if (!src || this.sprites[palette]) return;
+            await new Promise((resolve) => {
+                const img = new Image();
+                img.crossOrigin = 'anonymous';
+                img.onload = () => { this.sprites[palette] = img; resolve(); };
+                img.onerror = () => resolve();
+                img.src = src;
+            });
+        }
+
+        setPalette(name) {
+            if (!this.bundle) return;
+            const palettes = this.bundle.palettes || {};
+            const target = palettes[name] ? name : (palettes[this.palette] ? this.palette : 'DAY_BRIGHT');
+            this.palette = target;
+            this.colors = palettes[target] || {};
+            this.spriteUrl = this.spriteSources[target] || this.spriteUrl;
+            this.clearStyleCache();
+            this._symbolCache.clear();
+            this._patternCache.clear();
+            this._loadSprite(target);
         }
 
         setSettings(partial) {
             Object.assign(this.settings, partial);
-            this._styleCache = {};
+            if (partial.safetyContour != null && partial.safetyDepth == null) {
+                this.settings.safetyDepth = partial.safetyContour;
+            }
+            this.clearStyleCache();
         }
 
-        matchAttc(conditions, props) {
-            if (!conditions || !conditions.length) return true;
+        setDisplayCategory(cat) {
+            this.displayCategory = cat || 'STANDARD';
+            this.clearStyleCache();
+        }
+
+        setViewScaleDenom(denom) {
+            const n = Number(denom);
+            this.viewScaleDenom = Number.isFinite(n) && n > 0 ? n : 90_000;
+            this.clearStyleCache();
+        }
+
+        passesScaleLimits(props) {
+            if (!props || !this.settings.respectScamin) return true;
+            const view = this.viewScaleDenom;
+            const rawMin = props.SCAMIN;
+            if (rawMin != null && rawMin !== '') {
+                const scamin = Number(rawMin);
+                if (Number.isFinite(scamin) && view > scamin) return false;
+            }
+            const rawMax = props.SCAMAX;
+            if (rawMax != null && rawMax !== '') {
+                const scamax = Number(rawMax);
+                if (Number.isFinite(scamax) && view < scamax) return false;
+            }
+            if (!this.settings.showLowAccuracy) {
+                const quapos = Number(props.QUAPOS);
+                if (Number.isFinite(quapos) && quapos >= 2 && quapos <= 9) return false;
+            }
+            return true;
+        }
+
+        color(token, fallback) {
+            if (!token) return fallback || '#000000';
+            if (token[0] === '#') return token;
+            const key = token.length === 5 ? token + '0' : token;
+            return this.colors[key] || this.colors[token] || fallback || '#888888';
+        }
+
+        getSeaColor() { return this.color('DEPDW', '#9fc5e8'); }
+
+        // ---- Lookup matching ------------------------------------------------
+
+        _matchAttc(conditions, props) {
+            if (!conditions || !conditions.length) return 0;
+            let score = 0;
             for (const cond of conditions) {
                 if (cond.endsWith('?')) {
                     const attr = cond.slice(0, -1);
                     const v = props[attr];
-                    if (v != null && v !== '') return false;
+                    if (v != null && v !== '') return -1;
+                    score += 1;
                     continue;
                 }
-                const multi = cond.match(/^([A-Z]+)(\d+(?:,\d+)+)$/);
-                if (multi) {
-                    const attr = multi[1];
-                    const expected = multi[2].split(',');
+                const m = cond.match(/^([A-Z]+)(\d+(?:,\d+)*)$/);
+                if (m) {
+                    const attr = m[1];
+                    const expected = m[2].split(',');
                     const raw = props[attr];
-                    const parts = raw == null ? [] : String(raw).split(/[,;]/).map(s => s.trim());
-                    const ok = expected.every((e, i) => parts[i] === e || String(raw) === e);
-                    if (!ok) return false;
+                    if (raw == null || raw === '') return -1;
+                    const parts = String(raw).split(/[,;]/).map(s => s.trim());
+                    const ok = expected.every(e => parts.includes(e));
+                    if (!ok) return -1;
+                    score += 10 * expected.length;
                     continue;
                 }
-                const single = cond.match(/^([A-Z]+)(\d+)$/);
-                if (single) {
-                    if (String(props[single[1]]) !== single[2]) return false;
-                    continue;
-                }
-                if (!props[cond]) return false;
+                if (props[cond] == null || props[cond] === '') return -1;
+                score += 1;
             }
-            return true;
+            return score;
+        }
+
+        _categoryAllows(disp) {
+            const featureRank = DISPLAY_CATEGORY_RANK[(disp || 'STANDARD').toUpperCase()];
+            const userRank = DISPLAY_CATEGORY_RANK[this.displayCategory] || 1;
+            return featureRank <= userRank;
+        }
+
+        _preferredTable(geom) {
+            if (geom === 'L') {
+                return ['Lines', 'Plain', 'Symbolized', 'Simplified', 'Paper'];
+            }
+            if (geom === 'P') {
+                return ['Paper', 'Symbolized', 'Plain', 'Simplified', 'Lines'];
+            }
+            return ['Symbolized', 'Plain', 'Simplified', 'Lines', 'Paper'];
         }
 
         findRule(objectClass, geomType, props) {
             const rules = this.lookups[objectClass];
             if (!rules) return null;
             const g = GEOM_MAP[geomType] || 'P';
+            const preferred = this._preferredTable(g);
             let best = null;
             let bestScore = -1;
+            let bestTableIdx = preferred.length;
             for (const rule of rules) {
                 if (rule.geom !== g) continue;
-                if (!this.matchAttc(rule.attc, props)) continue;
-                const score = (rule.attc ? rule.attc.length : 0) * 10;
-                if (score > bestScore) { bestScore = score; best = rule; }
+                if (!this._categoryAllows(rule.disp)) continue;
+                const score = this._matchAttc(rule.attc, props);
+                if (score < 0) continue;
+                let tIdx = preferred.indexOf(rule.table);
+                if (tIdx < 0) tIdx = preferred.length;
+                if (
+                    tIdx < bestTableIdx ||
+                    (tIdx === bestTableIdx && score > bestScore)
+                ) {
+                    bestScore = score;
+                    bestTableIdx = tIdx;
+                    best = rule;
+                }
             }
-            return best || rules.find(r => r.geom === g && (!r.attc || !r.attc.length)) || null;
+            return best;
         }
+
+        // ---- Instruction parsing -------------------------------------------
 
         parseInstructions(inst) {
             const cmds = [];
             if (!inst) return cmds;
             for (const part of inst.split(';')) {
-                const m = part.match(/^([A-Z]{2})\((.*)\)$/);
+                const m = part.trim().match(/^([A-Z]{2})\((.*)\)$/);
                 if (m) cmds.push({ cmd: m[1], args: m[2] });
             }
             return cmds;
         }
 
-        _hasDrawableSymbol(cmds) {
-            return cmds.some(c => c.cmd === 'SY' || c.cmd === 'AC' || c.cmd === 'CS' || c.cmd === 'LS');
+        _splitSyArgs(args) {
+            const parts = args.split(',').map(s => s.trim());
+            return { name: parts[0], rotation: parts.length > 1 ? Number(parts[1]) : null };
         }
 
-        applyConditional(proc, props) {
-            const s = this.settings;
-            switch (proc) {
-                case 'DEPARE03': {
-                    if (props.DRVAL1 == null && props.DRVAL2 == null) {
-                        return { fill: this.color('NODTA0'), stroke: this.color('CHGRD0'), strokeWidth: 0.5 };
+        _splitApArgs(args) {
+            const parts = args.split(',').map(s => s.trim());
+            return { name: parts[0], rotation: parts.length > 1 ? Number(parts[1]) : null };
+        }
+
+        _splitLcArgs(args) {
+            return { name: args.trim().split(',')[0] };
+        }
+
+        // ---- Symbol / pattern rendering ------------------------------------
+
+        _baseScale() {
+            return (DEFAULT_DPI / MM_PER_INCH) / 100; // PresLib uses 1/100 mm units
+        }
+
+        _renderGlyphToCanvas(entry, opts) {
+            const v = entry.vector;
+            if (!v) return null;
+            const scaleMul = (opts && opts.scaleMul) || 1.0;
+            const baseScale = this._baseScale() * scaleMul;
+            const padding = 2;
+            const widthPx = Math.max(2, Math.ceil(v.w * baseScale)) + padding * 2;
+            const heightPx = Math.max(2, Math.ceil(v.h * baseScale)) + padding * 2;
+            const canvas = document.createElement('canvas');
+            canvas.width = widthPx;
+            canvas.height = heightPx;
+            const ctx = canvas.getContext('2d', { willReadFrequently: true });
+            ctx.translate(padding, padding);
+            const mapping = parseColorRef(entry.color_ref);
+            const fallbackToken = mapping.A ? this.color(mapping.A) : this.color('CHBLK');
+            const resolve = (sp) => {
+                const tok = mapping[sp];
+                return tok ? this.color(tok) : fallbackToken;
+            };
+            renderHpgl(parseHpgl(entry.hpgl), ctx, {
+                scale: baseScale,
+                originX: (v.origin && v.origin[0]) || 0,
+                originY: (v.origin && v.origin[1]) || 0,
+                baseLineWidth: 1,
+                resolveColor: resolve,
+                defaultColor: fallbackToken,
+            });
+            const pivot = v.pivot || v.origin || [v.w / 2, v.h / 2];
+            const ox = (v.origin && v.origin[0]) || 0;
+            const oy = (v.origin && v.origin[1]) || 0;
+            const anchorX = ((pivot[0] - ox) * baseScale + padding) / widthPx;
+            const anchorY = ((pivot[1] - oy) * baseScale + padding) / heightPx;
+            return { canvas, anchor: [clamp(anchorX, 0, 1), clamp(anchorY, 0, 1)] };
+        }
+
+        _targetSymbolPx() {
+            return (SYMBOL_SCALE_MM / MM_PER_INCH) * DEFAULT_DPI;
+        }
+
+        _buildRasterIcon(symName, rotation, opts) {
+            const sprite = this.sprites[this.palette];
+            if (!sprite || !sprite.complete || sprite.naturalWidth < 1) return null;
+            const base = symName.split(',')[0].trim();
+            const entry = this.symbols[base];
+            if (!entry || !entry.bitmap) return null;
+            const bm = entry.bitmap;
+            const dim = Math.max(bm.w, bm.h, 1);
+            const targetPx = (opts && opts.targetPx != null) ? opts.targetPx : this._targetSymbolPx();
+            const scaleMin = (opts && opts.scaleMin != null) ? opts.scaleMin : 0.35;
+            const scaleMax = (opts && opts.scaleMax != null) ? opts.scaleMax : 1.2;
+            const scale = clamp(targetPx / dim, scaleMin, scaleMax);
+            const rot = Number.isFinite(rotation) ? (rotation * Math.PI) / 180 : 0;
+            return new ol.style.Icon({
+                img: sprite,
+                imgSize: [sprite.naturalWidth, sprite.naturalHeight],
+                offset: [bm.x, bm.y],
+                size: [bm.w, bm.h],
+                anchor: bm.anchor || [0.5, 0.5],
+                scale,
+                rotation: rot,
+            });
+        }
+
+        buildRangeCircleSymbol(symName) {
+            const base = symName.split(',')[0].trim();
+            const entry = this.symbols[base];
+            if (!entry || !entry.bitmap) return null;
+            const bm = entry.bitmap;
+            const dim = Math.max(bm.w, bm.h, 1);
+            return this._buildRasterIcon(symName, 0, {
+                targetPx: dim * 0.92,
+                scaleMin: 0.55,
+                scaleMax: 2.0,
+            });
+        }
+
+        _buildVectorIcon(symName, rotation) {
+            const base = symName.split(',')[0].trim();
+            if (this.symbols[base] && this.symbols[base].bitmap) return null;
+            const entry = this.symbols[base];
+            if (!entry || !entry.hpgl) return null;
+            const cacheKey = `${this.palette}|${base}`;
+            let baked = this._symbolCache.get(cacheKey);
+            if (!baked) {
+                const targetPx = this._targetSymbolPx();
+                const vw = (entry.vector && entry.vector.w) || 400;
+                const scaleMul = targetPx / (vw * this._baseScale());
+                baked = this._renderGlyphToCanvas(entry, { scaleMul: clamp(scaleMul, 0.002, 0.02) });
+                if (!baked) return null;
+                this._symbolCache.set(cacheKey, baked);
+            }
+            const targetPx = this._targetSymbolPx();
+            const iconScale = clamp(targetPx / Math.max(baked.canvas.width, baked.canvas.height, 1), 0.35, 1.2);
+            const rot = Number.isFinite(rotation) ? (rotation * Math.PI) / 180 : 0;
+            return new ol.style.Icon({
+                img: baked.canvas,
+                imgSize: [baked.canvas.width, baked.canvas.height],
+                anchor: baked.anchor,
+                scale: iconScale,
+                rotation: rot,
+            });
+        }
+
+        buildSymbol(symName, rotation) {
+            const raster = this._buildRasterIcon(symName, rotation);
+            if (raster) return raster;
+            return this._buildVectorIcon(symName, rotation);
+        }
+
+        buildPatternFill(patName) {
+            const entry = this.patterns[patName];
+            if (!entry) return null;
+            const cacheKey = `${this.palette}|${patName}`;
+            let pattern = this._patternCache.get(cacheKey);
+            if (pattern === undefined) {
+                pattern = null;
+                if (entry.hpgl && entry.vector) {
+                    const baked = this._renderGlyphToCanvas(entry, { scaleMul: 0.014 });
+                    if (baked) {
+                        const ctx = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
+                        pattern = ctx.createPattern(baked.canvas, 'repeat');
                     }
-                    const d = props.DRVAL1 != null ? Number(props.DRVAL1) : 0;
-                    let token = 'DEPVS0';
-                    if (d >= s.deepContour) token = 'DEPDW0';
-                    else if (d >= s.safetyContour) token = 'DEPMD0';
-                    else if (d >= s.shallowContour) token = 'DEPMS0';
-                    else if (d < 0) token = 'DEPIT0';
-                    return { fill: this.color(token), stroke: this.color('CHGRD0'), strokeWidth: 0.5 };
                 }
-                case 'DEPCNT03': {
-                    const val = Number(props.VALDCO);
-                    const isSafety = !isNaN(val) && Math.abs(val - s.safetyContour) < 0.5;
+                this._patternCache.set(cacheKey, pattern);
+            }
+            return pattern;
+        }
+
+        _getLineStyleCanvas(name) {
+            const cacheKey = `${this.palette}|lc|${name}`;
+            if (this._symbolCache.has(cacheKey)) return this._symbolCache.get(cacheKey);
+            const entry = this.lineStyles[name];
+            if (!entry || !entry.hpgl) return null;
+            const baked = this._renderGlyphToCanvas(entry, { scaleMul: 0.01 });
+            if (baked) this._symbolCache.set(cacheKey, baked);
+            return baked;
+        }
+
+        _forEachLineSegment(geometry, fn) {
+            const type = geometry.getType();
+            const walk = (coords) => {
+                for (let i = 0; i < coords.length - 1; i++) fn(coords[i], coords[i + 1]);
+            };
+            if (type === 'LineString') walk(geometry.getCoordinates());
+            else if (type === 'MultiLineString') {
+                geometry.getCoordinates().forEach(walk);
+            }
+        }
+
+        _appendLcStyles(styles, geometry, lcName, zBase, resolution) {
+            if (resolution > 350) return;
+            const baked = this._getLineStyleCanvas(lcName);
+            if (!baked) return;
+            const entry = this.lineStyles[lcName];
+            const vw = (entry && entry.vector && entry.vector.w) || 3000;
+            const spacing = Math.max(resolution * 20, vw * this._baseScale() * 0.012);
+            const targetPx = this._targetSymbolPx();
+            const iconScale = clamp(targetPx / Math.max(baked.canvas.height, 8), 0.25, 0.9);
+            this._forEachLineSegment(geometry, (a, b) => {
+                const dx = b[0] - a[0];
+                const dy = b[1] - a[1];
+                const len = Math.hypot(dx, dy);
+                if (len < spacing * 0.25) return;
+                const rot = Math.atan2(dy, dx);
+                let d = spacing * 0.5;
+                while (d < len) {
+                    const t = d / len;
+                    styles.push(new ol.style.Style({
+                        geometry: new ol.geom.Point([a[0] + dx * t, a[1] + dy * t]),
+                        image: new ol.style.Icon({
+                            img: baked.canvas,
+                            imgSize: [baked.canvas.width, baked.canvas.height],
+                            anchor: baked.anchor,
+                            scale: iconScale,
+                            rotation: rot,
+                        }),
+                        zIndex: zBase + 2,
+                    }));
+                    d += spacing;
+                }
+            });
+        }
+
+        _areaInteriorPoint(feature) {
+            const geom = feature.getGeometry();
+            try {
+                return geom.getInteriorPoint();
+            } catch (e) {
+                const ext = geom.getExtent();
+                return new ol.geom.Point(ol.extent.getCenter(ext));
+            }
+        }
+
+        // ---- Conditional Symbology Procedures (CSP) ------------------------
+
+        _csp(proc, props, resolution, geomType) {
+            const base = (proc || '').replace(/\d+$/, '');
+            if (base === 'OBSTRN') {
+                return this._obstrnCsp(props, !!(geomType && geomType.includes('Point')));
+            }
+            if (base === 'WRECKS') {
+                return this._wrecksCsp(props, !!(geomType && geomType.includes('Point')));
+            }
+            const handler = this._cspHandlers[proc] || this._cspHandlers[base];
+            return handler ? handler.call(this, props, resolution) : null;
+        }
+
+        get _cspHandlers() {
+            if (this._cspH) return this._cspH;
+            const T = (token, fallback) => this.color(token, fallback);
+            this._cspH = {
+                DEPARE: (props) => {
+                    const s = this.settings;
+                    const dr1 = num(props.DRVAL1);
+                    const dr2 = num(props.DRVAL2);
+                    if (isNaN(dr1) && isNaN(dr2)) {
+                        return { fill: T('NODTA'), stroke: T('CHGRD'), strokeWidth: 0.5 };
+                    }
+                    const d = !isNaN(dr1) ? dr1 : dr2;
+                    let token = 'DEPVS';
+                    if (d < 0) token = 'DEPIT';
+                    else if (s.twoShades) {
+                        token = d >= s.safetyContour ? 'DEPDW' : 'DEPVS';
+                    } else if (d >= s.deepContour) token = 'DEPDW';
+                    else if (d >= s.safetyContour) token = 'DEPMD';
+                    else if (d >= s.shallowContour) token = 'DEPMS';
+                    const isSafetyBoundary = !isNaN(dr1) && !isNaN(dr2) && (
+                        (dr1 < s.safetyContour && dr2 >= s.safetyContour) ||
+                        (dr2 < s.safetyContour && dr1 >= s.safetyContour)
+                    );
                     return {
-                        stroke: this.color(isSafety ? 'CHBLK0' : 'DEPCN0'),
-                        strokeWidth: isSafety ? 2 : 0.6,
-                        lineDash: !isSafety && val > 20 ? [6, 4] : null,
+                        fill: T(token),
+                        stroke: isSafetyBoundary ? T('DEPSC') : null,
+                        strokeWidth: isSafetyBoundary ? 1.2 : 0,
                     };
-                }
-                case 'SOUNDG03': {
-                    const depth = Number(props.depth);
-                    const shallow = !isNaN(depth) && depth <= s.safetyDepth;
+                },
+                DEPCNT: (props) => {
+                    const s = this.settings;
+                    const v = num(props.VALDCO);
+                    const safety = !isNaN(v) && Math.abs(v - s.safetyContour) < 0.5;
                     return {
-                        textColor: this.color(shallow ? 'CHBLK0' : 'DEPCN0'),
-                        textStroke: shallow ? this.color('CHWHT0') : 'rgba(255,255,255,0.85)',
-                        fontWeight: shallow ? 'bold' : 'normal',
-                        fontSize: shallow ? 11 : 10,
+                        stroke: T(safety ? 'DEPSC' : 'DEPCN'),
+                        strokeWidth: safety ? 1.5 : 0.6,
+                        lineDash: null,
                     };
-                }
-                case 'LIGHTS06':
-                    return this._lightsColors(props);
-                case 'OBSTRN07':
-                    return { fill: 'transparent', stroke: this.color('CHGRD0'), strokeWidth: 1, lineDash: [4, 4] };
-                case 'WRECKS05':
-                    return { fill: 'transparent', stroke: this.color('CHBLK0'), strokeWidth: 1, lineDash: [4, 4] };
-                case 'SLCONS04':
-                    return { stroke: this.color('CHBLK0'), strokeWidth: 2 };
-                case 'QUAPOS01':
-                    return { stroke: this.color('CSTLN0'), strokeWidth: 1, lineDash: [4, 4] };
-                default:
+                },
+                SOUNDG: (props) => {
+                    const s = this.settings;
+                    const depth = num(props.depth);
+                    const isShallow = !isNaN(depth) && depth <= s.safetyDepth;
+                    return {
+                        textColor: T(isShallow ? 'SNDG2' : 'SNDG1'),
+                        textStroke: 'rgba(255,255,255,0.85)',
+                        fontWeight: isShallow ? 'bold' : 'normal',
+                        fontSize: isShallow ? 11 : 10,
+                    };
+                },
+                LIGHTS: (props, resolution) => this._lightsCsp(props, resolution),
+                UDWHAZ: (props) => this._obstrnCsp(props, true),
+                SLCONS: (props) => {
+                    const cat = num(props.CATSLC);
+                    const w = num(props.WATLEV);
+                    if (w === 3 || w === 4) {
+                        return {
+                            fill: withAlpha(T('DEPIT'), 0.35),
+                            stroke: T('CSTLN'),
+                            strokeWidth: 0.8,
+                        };
+                    }
+                    if (cat === 6 || cat === 15 || cat === 16) {
+                        return { stroke: T('CSTLN'), strokeWidth: 1.5 };
+                    }
+                    return { stroke: T('CSTLN'), strokeWidth: 1 };
+                },
+                QUAPOS: (props) => {
+                    const q = num(props.QUAPOS);
+                    if (q >= 2 && q <= 9) {
+                        return { stroke: T('CSTLN'), strokeWidth: 1, lineDash: [4, 4] };
+                    }
                     return null;
-            }
+                },
+                TOPMAR: (props) => {
+                    const top = num(props.TOPSHP);
+                    const map = {
+                        1: 'TOPMAR02', 2: 'TOPMAR04', 3: 'TOPMAR10', 4: 'TOPMAR12',
+                        5: 'TOPMAR13', 6: 'TOPMAR14', 7: 'TOPMAR18', 8: 'TOPMAR22',
+                        9: 'TOPMAR02', 10: 'TOPMAR02', 11: 'TOPMAR02',
+                        12: 'TOPMAR02', 13: 'TOPMAR02', 14: 'TOPMAR02',
+                    };
+                    return { symbolName: map[top] || 'TOPMAR02' };
+                },
+                RESARE: (props) => {
+                    const restrn = props.RESTRN;
+                    const cat = props.CATREA;
+                    let symbol = 'RESARE51';
+                    if (cat) symbol = 'RESARE61';
+                    if (restrn) symbol = 'RESARE71';
+                    return {
+                        symbolName: symbol,
+                        fill: withAlpha(T('CHMGF'), 0.18),
+                        stroke: T('CHMGD'),
+                        strokeWidth: 1.2,
+                        lineDash: [8, 4],
+                    };
+                },
+                RESTRN: (props) => {
+                    if (!props.RESTRN) return null;
+                    return { symbolName: 'ENTRES51', stroke: T('CHMGD'), strokeWidth: 1.2, lineDash: [8, 4] };
+                },
+                DATCVR: () => ({ stroke: T('CHMGF'), strokeWidth: 1, lineDash: [12, 4] }),
+                SYMINS: () => null,
+            };
+            this._cspH.DEPARE01 = this._cspH.DEPARE;
+            this._cspH.DEPARE02 = this._cspH.DEPARE;
+            this._cspH.DEPARE03 = this._cspH.DEPARE;
+            this._cspH.DEPCNT02 = this._cspH.DEPCNT;
+            this._cspH.DEPCNT03 = this._cspH.DEPCNT;
+            this._cspH.SOUNDG02 = this._cspH.SOUNDG;
+            this._cspH.SOUNDG03 = this._cspH.SOUNDG;
+            this._cspH.LIGHTS05 = this._cspH.LIGHTS;
+            this._cspH.LIGHTS06 = this._cspH.LIGHTS;
+            this._cspH.SLCONS03 = this._cspH.SLCONS;
+            this._cspH.SLCONS04 = this._cspH.SLCONS;
+            this._cspH.QUAPOS01 = this._cspH.QUAPOS;
+            this._cspH.TOPMAR01 = this._cspH.TOPMAR;
+            this._cspH.RESARE02 = this._cspH.RESARE;
+            this._cspH.RESARE01 = this._cspH.RESARE;
+            this._cspH.RESTRN01 = this._cspH.RESTRN;
+            this._cspH.DATCVR01 = this._cspH.DATCVR;
+            this._cspH.UDWHAZ03 = this._cspH.UDWHAZ;
+            this._cspH.UDWHAZ04 = this._cspH.UDWHAZ;
+            return this._cspH;
         }
 
-        _lightsColors(props) {
-            const colour = Number(props.COLOUR);
-            let fill = 'LITYW0';
-            if (colour === 3) fill = 'LITRD0';
-            else if (colour === 4) fill = 'LITGN0';
-            else if (colour === 1 || colour === 6) fill = 'CHWHT0';
-            return { symbolFill: this.color(fill), symbolStroke: this.color('CHBLK0') };
+        _lightColourToken(code) {
+            const map = {
+                1: 'LITYW', 3: 'LITRD', 4: 'LITGN', 6: 'LITYW', 11: 'LITYW', 12: 'CHMGD',
+            };
+            return map[code] || 'LITYW';
         }
 
-        _symbolSpec(symName, props) {
-            const c = this.color.bind(this);
-            const colour = Number(props.COLOUR);
+        _lightSymbolName(code) {
+            const map = {
+                3: 'LIGHTS11', 4: 'LIGHTS12', 1: 'LIGHTS13', 6: 'LIGHTS13', 11: 'LIGHTS13', 12: 'LIGHTS14',
+            };
+            return map[code] || 'LIGHTS13';
+        }
 
-            if (/^BOY/.test(symName)) {
-                let fill = c('CHGRN0');
-                if (colour === 3 || /14|24/.test(symName)) fill = c('CHRED0');
-                else if (colour === 4 || /13|23/.test(symName)) fill = c('CHGRN0');
-                else if (colour === 6) fill = c('CHYLW0');
-                return { kind: 'triangle', fill, stroke: c('CHBLK0'), radius: 6 };
+        _lightSectorRadiusM(valnmr) {
+            if (isNaN(valnmr) || valnmr <= 0) return 0;
+            return valnmr * NM_METERS;
+        }
+
+        /** S-52 LIGHTS05: all-round lights use fixed-size range circles (LIGHTS90–96). */
+        _isAllroundLight(props) {
+            const catlit = num(props.CATLIT);
+            if ([1, 8, 11, 12, 18, 19, 20].includes(catlit)) return false;
+            const sectr1 = num(props.SECTR1);
+            const sectr2 = num(props.SECTR2);
+            if (!Number.isFinite(sectr1) || !Number.isFinite(sectr2)) return true;
+            if (sectr1 === 0 && sectr2 === 0) return true;
+            if (sectr1 === 0 && sectr2 >= 359.5) return true;
+            let sweep = sectr2 - sectr1;
+            if (sweep < 0) sweep += 360;
+            return sweep >= 359.5;
+        }
+
+        _lightRangeCircleSymbol(colourCode, valnmr) {
+            const big = Number.isFinite(valnmr) && valnmr >= 5;
+            const map = {
+                3: big ? 'LIGHTS96' : 'LIGHTS93',
+                4: big ? 'LIGHTS95' : 'LIGHTS92',
+                1: big ? 'LIGHTS94' : 'LIGHTS91',
+                6: big ? 'LIGHTS94' : 'LIGHTS91',
+                11: big ? 'LIGHTS94' : 'LIGHTS91',
+            };
+            return map[colourCode] || (big ? 'LIGHTS94' : 'LIGHTS90');
+        }
+
+        _lightRangeCircleFallback(colourCode, valnmr) {
+            const big = Number.isFinite(valnmr) && valnmr >= 5;
+            const tok = this._lightColourToken(colourCode);
+            const strokeTok = (colourCode === 3 || colourCode === 4) ? tok : 'CHYLW';
+            return {
+                kind: 'range_circle',
+                stroke: this.color(strokeTok),
+                radius: big ? 23 : 16,
+                strokeWidth: 2,
+            };
+        }
+
+        _lightsCsp(props, resolution) {
+            const colours = parseColourList(props);
+            const code = colours.length ? colours[0] : NaN;
+            const tok = this._lightColourToken(code);
+            const symbolName = this._lightSymbolName(code);
+            const sectr1 = num(props.SECTR1);
+            const sectr2 = num(props.SECTR2);
+            const valnmr = num(props.VALNMR);
+            const sectors = [];
+            const allround = this._isAllroundLight(props);
+            let rangeCircleSymbol = allround ? this._lightRangeCircleSymbol(code, valnmr) : null;
+            let rangeCircleFallback = allround ? this._lightRangeCircleFallback(code, valnmr) : null;
+
+            // Geographic sector arcs only when zoomed in; overview uses fixed-size circles.
+            const geoSectorMaxRes = 2500;
+            if (this.settings.showVisibleSectorLights && resolution < geoSectorMaxRes && !allround) {
+                const radiusM = this._lightSectorRadiusM(valnmr);
+                if (radiusM > 0) {
+                    const hasSectr = Number.isFinite(sectr1) && Number.isFinite(sectr2)
+                        && !(sectr1 === 0 && sectr2 === 0);
+                    if (!hasSectr) {
+                        sectors.push({
+                            sectr1: 0,
+                            sectr2: 360,
+                            radiusM,
+                            stroke: this.color('LITYW'),
+                            strokeWidth: 1.2,
+                            legs: false,
+                        });
+                    } else {
+                        let sweep = sectr2 - sectr1;
+                        if (sweep < 0) sweep += 360;
+                        if (sweep >= 359.5) {
+                            sectors.push({
+                                sectr1: 0,
+                                sectr2: 360,
+                                radiusM,
+                                stroke: this.color('LITYW'),
+                                strokeWidth: 1.2,
+                                legs: false,
+                            });
+                        } else if (sweep > 0) {
+                            sectors.push({
+                                sectr1,
+                                sectr2,
+                                radiusM,
+                                stroke: this.color(tok),
+                                strokeWidth: 1.2,
+                                legs: true,
+                            });
+                        }
+                    }
+                }
             }
-            if (/^BCN/.test(symName)) {
-                let fill = c('CHRED0');
-                if (colour === 4) fill = c('CHGRN0');
-                return { kind: 'square', fill, stroke: c('CHBLK0'), radius: 6 };
+
+            return { symbolName, sectors, rangeCircleSymbol, rangeCircleFallback };
+        }
+
+        _obstrnCsp(props, isPoint) {
+            const s = this.settings;
+            const valsou = num(props.VALSOU);
+            const watlev = num(props.WATLEV);
+            if (!isNaN(valsou) && valsou <= s.safetyContour) {
+                return { symbolName: 'DANGER51', fill: this.color('DNGHL'), stroke: this.color('CHBLK'), strokeWidth: 0.8 };
             }
-            if (/^LIGHTS|^LIT/.test(symName)) {
-                const ls = this._lightsColors(props);
-                return { kind: 'light', fill: ls.symbolFill, stroke: ls.symbolStroke, radius: 5 };
+            if (watlev === 1 || watlev === 2) {
+                return {
+                    symbolName: isPoint ? 'OBSTRN11' : null,
+                    fill: this.color('CHBRN'),
+                    stroke: this.color('CSTLN'),
+                    strokeWidth: 0.6,
+                };
             }
-            if (/^FOG/.test(symName)) {
-                return { kind: 'circle', fill: c('CHMGD0'), stroke: c('CHBLK0'), radius: 5 };
+            if (isPoint) {
+                return { symbolName: 'OBSTRN11' };
             }
-            if (/FOULGND|OBSTRN/.test(symName)) {
-                return { kind: 'star', fill: c('CHBLK0'), stroke: c('CHBLK0'), radius: 5 };
+            return {
+                fill: withAlpha(this.color('CHGRD'), 0.08),
+                stroke: this.color('CHGRD'),
+                strokeWidth: 0.4,
+                lineDash: [4, 4],
+            };
+        }
+
+        _wrecksCsp(props, isPoint) {
+            const s = this.settings;
+            const valsou = num(props.VALSOU);
+            const watlev = num(props.WATLEV);
+            if (!isNaN(valsou) && valsou <= s.safetyContour) {
+                return { symbolName: 'DANGER51', fill: this.color('DNGHL'), stroke: this.color('CHBLK'), strokeWidth: 0.8 };
             }
-            if (/WRECK/.test(symName)) {
-                return { kind: 'cross', fill: c('CHBLK0'), stroke: c('CHBLK0'), radius: 6 };
+            if (watlev === 1 || watlev === 2) {
+                return {
+                    symbolName: isPoint ? 'WRECKS01' : null,
+                    fill: this.color('CHBRN'),
+                    stroke: this.color('CSTLN'),
+                    strokeWidth: 0.6,
+                };
             }
-            if (/ACHBRT|ACHARE/.test(symName)) {
-                return { kind: 'circle', fill: c('CHMGD0'), stroke: c('CHMGF0'), radius: 5 };
+            if (isPoint) {
+                return { symbolName: 'WRECKS01' };
             }
-            if (/LNDMRK/.test(symName)) {
-                return { kind: 'triangle', fill: c('CHBRN0'), stroke: c('CHBLK0'), radius: 5 };
+            return {
+                fill: 'transparent',
+                stroke: this.color('CHGRD'),
+                strokeWidth: 0.4,
+                lineDash: [4, 4],
+            };
+        }
+
+        // ---- Text instructions ---------------------------------------------
+
+        _parseTextCmd(args) {
+            const te = args.match(/^TE\('([^']*)','([^']*)',(\d+),(\d+),(\d+),'[^']*',(-?\d+),(-?\d+),([A-Z]+),(\d+)\)$/);
+            if (te) {
+                return {
+                    template: te[1], attr: te[2],
+                    hjust: Number(te[3]), vjust: Number(te[4]), space: Number(te[5]),
+                    xoff: Number(te[6]), yoff: Number(te[7]),
+                    color: te[8], size: Number(te[9]),
+                };
+            }
+            const tx = args.match(/^TX\(([^,]+),(\d+),(\d+),(\d+),'[^']*',(-?\d+),(-?\d+),([A-Z]+),(\d+)\)$/);
+            if (tx) {
+                return {
+                    template: null, attr: tx[1],
+                    hjust: Number(tx[2]), vjust: Number(tx[3]), space: Number(tx[4]),
+                    xoff: Number(tx[5]), yoff: Number(tx[6]),
+                    color: tx[7], size: Number(tx[8]),
+                };
             }
             return null;
         }
 
-        _buildSymbol(spec) {
-            const stroke = new ol.style.Stroke({ color: spec.stroke, width: 1.2 });
-            const fill = new ol.style.Fill({ color: spec.fill });
-            switch (spec.kind) {
-                case 'triangle':
-                    return new ol.style.RegularShape({ points: 3, radius: spec.radius, fill, stroke, angle: 0 });
-                case 'square':
-                    return new ol.style.RegularShape({ points: 4, radius: spec.radius, fill, stroke, angle: Math.PI / 4 });
-                case 'star':
-                    return new ol.style.RegularShape({ points: 5, radius: spec.radius, radius2: spec.radius / 2, fill, stroke });
-                case 'cross':
-                    return new ol.style.Text({
-                        text: '\u2715',
-                        font: `bold ${spec.radius * 2}px sans-serif`,
-                        fill: new ol.style.Fill({ color: spec.fill }),
-                        stroke: new ol.style.Stroke({ color: 'rgba(255,255,255,0.85)', width: 1.5 }),
-                    });
-                case 'light':
-                    return new ol.style.RegularShape({
-                        points: 4,
-                        radius: spec.radius,
-                        radius2: 2,
-                        fill,
-                        stroke,
-                        angle: Math.PI / 4,
-                    });
-                default:
-                    return new ol.style.Circle({ radius: spec.radius, fill, stroke });
+        _formatText(te, props) {
+            const val = props[te.attr];
+            if (val == null || val === '') return null;
+            if (te.template && te.template.includes('%')) {
+                // Handle the limited printf flavour PresLib uses (e.g. %s, %4.1lf).
+                return te.template.replace(/%[-+0-9.]*[sld]+/g, (m) => {
+                    if (m.endsWith('s')) return String(val);
+                    const numVal = Number(val);
+                    if (!Number.isFinite(numVal)) return String(val);
+                    const dec = m.match(/\.(\d+)/);
+                    return dec ? numVal.toFixed(Number(dec[1])) : String(Math.round(numVal));
+                });
             }
+            return String(val);
         }
+
+        // ---- Top-level style entry point -----------------------------------
 
         getStyle(feature, resolution) {
             if (!this.ready) return null;
-
             const layer = feature.get('layer');
             const geomType = feature.getGeometry().getType();
-            const props = {};
-            feature.getKeys().forEach(k => { if (k !== 'geometry') props[k] = feature.get(k); });
+            const props = feature.getProperties();
 
-            if (HIDDEN_POINT_LAYERS.has(layer) && geomType.includes('Point')) {
-                return null;
-            }
+            if (HIDDEN_POINT_LAYERS.has(layer) && geomType.includes('Point')) return null;
+            if (!this.settings.showSoundings && layer === 'SOUNDG') return null;
+            if (!this.passesScaleLimits(props)) return null;
 
-            const cacheKey = `${layer}|${geomType}|${resolution | 0}|${props.DRVAL1}|${props.DRVAL2}|${props.VALDCO}|${props.depth}|${props.COLOUR}|${props.BOYSHP}|${props.BCNSHP}`;
+            const resBucket = styleResolutionBucket(resolution);
+            const cacheKey = [
+                this.palette, this.displayCategory, layer, geomType, resBucket,
+                this.viewScaleDenom | 0,
+                props.DRVAL1, props.DRVAL2, props.VALDCO, props.depth,
+                props.COLOUR, props.BOYSHP, props.BCNSHP, props.TOPSHP,
+                props.SECTR1, props.SECTR2, props.VALNMR, props.ORIENT,
+                props.OBJNAM, props.NOBJNM, props.LITCHR, props.SIGGRP, props.SIGPER,
+                props.HEIGHT, props.CATSLC, props.WATLEV, props.CATREA, props.RESTRN,
+                props.SCAMIN, props.SCAMAX,
+                this.settings.shallowContour, this.settings.safetyContour, this.settings.deepContour,
+                this.settings.showText, this.settings.showLightDescriptions,
+                this.settings.showBuoyLightLabels, this.settings.showVisibleSectorLights,
+                this.settings.imperialLightText,
+                this.settings.respectScamin,
+            ].join('|');
             if (this._styleCache[cacheKey] !== undefined) return this._styleCache[cacheKey];
 
             const rule = this.findRule(layer, geomType, props);
+            const result = this._buildStyle(rule, layer, geomType, props, feature, resolution);
+            this._rememberStyle(cacheKey, result);
+            return result;
+        }
+
+        _buildStyle(rule, layer, geomType, props, feature, resolution) {
             const cmds = rule ? this.parseInstructions(rule.inst) : [];
+            const isPoly = geomType.includes('Polygon');
+            const isLine = geomType.includes('Line');
+            const isPoint = geomType.includes('Point');
+            const zBase = (rule ? rule.prio : 4) * 10;
 
             let fill = null;
             let stroke = null;
             let strokeWidth = 1;
             let lineDash = null;
+            let patternFill = null;
             let symbol = null;
+            let symbolName = null;
+            let lcName = null;
+            let symbolRotation = num(props.ORIENT);
+            let sectors = [];
+            let rangeCircleSymbol = null;
+            let rangeCircleFallback = null;
+            const labels = [];
 
-            for (const { cmd, args } of cmds) {
-                if (cmd === 'CS') {
-                    const cs = this.applyConditional(args, props);
-                    if (cs) {
-                        if (cs.fill != null) fill = cs.fill;
-                        if (cs.stroke) { stroke = cs.stroke; strokeWidth = cs.strokeWidth || 1; lineDash = cs.lineDash; }
-                        if (cs.symbolFill) symbol = { kind: 'light', fill: cs.symbolFill, stroke: cs.symbolStroke, radius: 5 };
+            if (!rule) {
+                const def = LAYER_DEFAULTS[layer];
+                if (def) {
+                    if (def.fill) fill = def.fillAlpha != null ? withAlpha(this.color(def.fill), def.fillAlpha) : this.color(def.fill);
+                    if (def.stroke) {
+                        stroke = this.color(def.stroke);
+                        strokeWidth = def.strokeWidth || 1;
+                        lineDash = def.lineDash || null;
                     }
-                } else if (cmd === 'AC') {
-                    fill = this.color(args);
-                } else if (cmd === 'LS') {
-                    const p = args.split(',');
-                    stroke = this.color(p[2]);
-                    strokeWidth = Number(p[1]) || 1;
-                    lineDash = LINE_DASH[p[0]] || null;
-                } else if (cmd === 'SY') {
-                    symbol = this._symbolSpec(args, props);
                 }
             }
 
-            const isPoly = geomType.includes('Polygon');
-            const isLine = geomType.includes('Line');
-            const isPoint = geomType.includes('Point');
+            const applyCsp = (csp) => {
+                if (!csp) return;
+                if (csp.fill !== undefined) fill = csp.fill;
+                if (csp.stroke) { stroke = csp.stroke; strokeWidth = csp.strokeWidth || 1; }
+                if (csp.lineDash !== undefined) lineDash = csp.lineDash;
+                if (csp.symbolName) { symbolName = csp.symbolName; symbol = null; }
+                if (csp.symbol) { symbol = csp.symbol; symbolName = csp.symbolName || null; }
+                if (csp.symbolFill) {
+                    symbol = symbol || { kind: 'light_flare', fill: csp.symbolFill, stroke: csp.symbolStroke, radius: 5 };
+                }
+                if (csp.sectors) sectors = csp.sectors;
+                if (csp.rangeCircleSymbol) rangeCircleSymbol = csp.rangeCircleSymbol;
+                if (csp.rangeCircleFallback) rangeCircleFallback = csp.rangeCircleFallback;
+            };
+
+            for (const { cmd, args } of cmds) {
+                if (cmd === 'AC') {
+                    fill = this.color(args);
+                } else if (cmd === 'AP') {
+                    const ap = this._splitApArgs(args);
+                    const allowPattern = resolution < 90
+                        && !(LIGHT_AREA_PATTERN_LAYERS.has(layer) && resolution > 50);
+                    if (allowPattern) {
+                        const pat = this.buildPatternFill(ap.name);
+                        if (pat) patternFill = pat;
+                    }
+                } else if (cmd === 'LS') {
+                    const parts = args.split(',');
+                    stroke = this.color(parts[2]);
+                    strokeWidth = lsWidthPx(parts[1]);
+                    lineDash = LINE_DASH[parts[0]] || null;
+                } else if (cmd === 'LC' && !NO_LC_LAYERS.has(layer)) {
+                    const lc = this._splitLcArgs(args);
+                    lcName = lc.name;
+                    if (!stroke) {
+                        const entry = this.lineStyles[lc.name];
+                        if (entry && entry.color_ref) {
+                            const mapping = parseColorRef(entry.color_ref);
+                            stroke = this.color(mapping.A || 'CHBLK');
+                            strokeWidth = 1;
+                        }
+                    }
+                } else if (cmd === 'SY') {
+                    const sy = this._splitSyArgs(args);
+                    symbolName = sy.name;
+                    if (Number.isFinite(sy.rotation)) symbolRotation = sy.rotation;
+                } else if (cmd === 'CS') {
+                    applyCsp(this._csp(args, props, resolution, geomType));
+                } else if (cmd === 'TE' || cmd === 'TX') {
+                    if (!this.settings.showText) continue;
+                    const te = this._parseTextCmd(args);
+                    const text = te ? this._formatText(te, props) : null;
+                    if (text) {
+                        labels.push({
+                            text,
+                            color: this.color(te.color),
+                            size: clamp(Math.round(te.size / 2.5), 8, 14),
+                            offsetX: te.xoff * 2,
+                            offsetY: -te.yoff * 2,
+                        });
+                    }
+                }
+            }
+
             const styles = [];
 
-            if (isPoly && fill) {
-                styles.push(new ol.style.Style({
-                    fill: new ol.style.Fill({ color: withAlpha(fill, 0.9) }),
-                    stroke: stroke ? new ol.style.Stroke({ color: stroke, width: strokeWidth, lineDash: lineDash || undefined }) : undefined,
-                }));
-            } else if (isLine && stroke) {
-                styles.push(new ol.style.Style({
-                    stroke: new ol.style.Stroke({ color: stroke, width: strokeWidth, lineDash: lineDash || undefined }),
-                }));
+            // Polygon body
+            if (isPoly) {
+                if (patternFill) {
+                    styles.push(new ol.style.Style({
+                        fill: new ol.style.Fill({ color: patternFill }),
+                        zIndex: zBase,
+                    }));
+                }
+                if (fill) {
+                    styles.push(new ol.style.Style({
+                        fill: new ol.style.Fill({ color: fill }),
+                        zIndex: zBase - 1,
+                    }));
+                }
+                if (stroke) {
+                    styles.push(new ol.style.Style({
+                        stroke: new ol.style.Stroke({
+                            color: stroke, width: strokeWidth,
+                            lineDash: lineDash || undefined,
+                        }),
+                        zIndex: zBase,
+                    }));
+                }
             }
 
-            if (layer === 'SOUNDG' && props.depth != null) {
-                const cs = this.applyConditional('SOUNDG03', props);
+            // Line body
+            if (isLine && stroke) {
+                styles.push(new ol.style.Style({
+                    stroke: new ol.style.Stroke({
+                        color: stroke, width: strokeWidth,
+                        lineDash: lineDash || undefined,
+                    }),
+                    zIndex: zBase,
+                }));
+            }
+            if (isLine && lcName && !NO_LC_LAYERS.has(layer)) {
+                this._appendLcStyles(styles, feature.getGeometry(), lcName, zBase, resolution);
+            }
+
+            if (isPoly && resolution > 70 && LIGHT_AREA_PATTERN_LAYERS.has(layer)) {
+                stroke = null;
+            }
+
+            // Area / line point symbols (TSSLPT arrows, ACHARE, etc.)
+            if ((isPoly || isLine) && symbolName && !isPoint && resolution < 400) {
+                const img = this.buildSymbol(symbolName, symbolRotation);
+                if (img) {
+                    const ptGeom = isPoly ? this._areaInteriorPoint(feature) : null;
+                    if (ptGeom) {
+                        styles.push(new ol.style.Style({ geometry: ptGeom, image: img, zIndex: zBase + 4 }));
+                    }
+                }
+            }
+
+            // Soundings render their depth value directly
+            if (layer === 'SOUNDG' && isPoint && props.depth != null) {
+                const cs = this._csp('SOUNDG02', props, resolution);
+                const depthVal = Number(props.depth);
+                const depthAbs = Math.abs(depthVal);
+                let depthText;
+                if (depthAbs < 31) {
+                    const whole = Math.floor(depthAbs);
+                    const frac = Math.round((depthAbs - whole) * 10);
+                    depthText = frac > 0 ? `${whole}.${frac}` : String(whole);
+                } else {
+                    depthText = String(Math.round(depthAbs));
+                }
+                if (depthVal < 0) depthText = depthText + '̅';
                 styles.push(new ol.style.Style({
                     text: new ol.style.Text({
-                        text: Number(props.depth).toFixed(1),
+                        text: depthText,
                         font: `${cs.fontWeight} ${cs.fontSize}px Consolas, monospace`,
                         fill: new ol.style.Fill({ color: cs.textColor }),
-                        stroke: new ol.style.Stroke({ color: cs.textStroke, width: 2 }),
+                        stroke: new ol.style.Stroke({ color: cs.textStroke, width: 2.5 }),
                     }),
+                    zIndex: zBase + 5,
                 }));
-            } else if (isPoint && symbol) {
-                styles.push(new ol.style.Style({ image: this._buildSymbol(symbol) }));
-            } else if (isPoint && layer === 'LIGHTS') {
-                const ls = this._lightsColors(props);
-                const r = resolution < 80 ? 6 : resolution < 300 ? 5 : 4;
-                styles.push(new ol.style.Style({
-                    image: new ol.style.RegularShape({
-                        points: 4,
-                        radius: r,
-                        radius2: 2,
-                        fill: new ol.style.Fill({ color: ls.symbolFill }),
-                        stroke: new ol.style.Stroke({ color: ls.symbolStroke, width: 1.2 }),
-                        angle: Math.PI / 4,
-                    }),
-                }));
-            } else if (isPoint && !this._hasDrawableSymbol(cmds)) {
-                return null;
             }
 
-            const result = styles.length ? (styles.length === 1 ? styles[0] : styles) : null;
-            this._styleCache[cacheKey] = result;
-            return result;
+            // Point symbol & sectors
+            if (isPoint) {
+                const center = feature.getGeometry().getCoordinates();
+                if (rangeCircleSymbol || rangeCircleFallback) {
+                    let circleImg = rangeCircleSymbol
+                        ? this.buildRangeCircleSymbol(rangeCircleSymbol)
+                        : null;
+                    if (!circleImg && rangeCircleFallback) {
+                        circleImg = this._fallbackSymbolImage(rangeCircleFallback);
+                    }
+                    if (circleImg) {
+                        styles.push(new ol.style.Style({ image: circleImg, zIndex: zBase }));
+                    }
+                }
+                for (const sec of sectors) {
+                    for (const sectorGeom of this._lightSectorGeometries(center, sec)) {
+                        styles.push(new ol.style.Style({
+                            geometry: sectorGeom,
+                            stroke: new ol.style.Stroke({
+                                color: sec.stroke,
+                                width: sec.strokeWidth || 1.2,
+                            }),
+                            zIndex: zBase - 1,
+                        }));
+                    }
+                }
+
+                let image = null;
+                if (symbolName) image = this.buildSymbol(symbolName, symbolRotation);
+                if (!image && symbol) image = this._fallbackSymbolImage(symbol);
+                if (!image && layer === 'LIGHTS') {
+                    image = this._fallbackSymbolImage({
+                        kind: 'light_flare',
+                        fill: this.color('LITYW'), stroke: this.color('CHBLK'), radius: 6,
+                    });
+                }
+                if (image) {
+                    styles.push(new ol.style.Style({ image, zIndex: zBase + 3 }));
+                }
+            }
+
+            for (const lb of labels.concat(this._autoLabels(layer, props, resolution))) {
+                styles.push(new ol.style.Style({
+                    text: new ol.style.Text({
+                        text: lb.text,
+                        font: `${lb.fontWeight || 'normal'} ${lb.size || 10}px sans-serif`,
+                        offsetX: lb.offsetX || 0,
+                        offsetY: lb.offsetY || 0,
+                        fill: new ol.style.Fill({ color: lb.color }),
+                        stroke: new ol.style.Stroke({ color: 'rgba(255,255,255,0.9)', width: 2.5 }),
+                        overflow: !isPoint,
+                    }),
+                    zIndex: zBase + 5,
+                }));
+            }
+
+            if (isLine && layer === 'DEPCNT' && resolution < 300) {
+                const v = num(props.VALDCO);
+                if (!isNaN(v)) {
+                    styles.push(new ol.style.Style({
+                        text: new ol.style.Text({
+                            text: String(v),
+                            font: '9px sans-serif',
+                            placement: 'line',
+                            overflow: true,
+                            fill: new ol.style.Fill({ color: this.color('DEPCN') }),
+                            stroke: new ol.style.Stroke({ color: 'rgba(255,255,255,0.85)', width: 2 }),
+                        }),
+                        zIndex: zBase + 1,
+                    }));
+                }
+            }
+
+            return styles.length ? (styles.length === 1 ? styles[0] : styles) : null;
         }
 
-        getSeaColor() {
-            return this.color('DEPDW0');
+        _fallbackSymbolImage(spec) {
+            const stroke = new ol.style.Stroke({ color: spec.stroke || '#000', width: 1.2 });
+            const fill = new ol.style.Fill({ color: spec.fill || '#000' });
+            switch (spec.kind) {
+                case 'buoy_cone':
+                    return new ol.style.RegularShape({ points: 3, radius: spec.radius || 6, fill, stroke });
+                case 'buoy_pillar':
+                    return new ol.style.RegularShape({ points: 4, radius: (spec.radius || 6) * 0.75, fill, stroke, angle: Math.PI / 4 });
+                case 'beacon':
+                    return new ol.style.RegularShape({ points: 4, radius: spec.radius || 6, fill, stroke, angle: Math.PI / 4 });
+                case 'star':
+                    return new ol.style.RegularShape({ points: 5, radius: spec.radius || 6, radius2: (spec.radius || 6) / 2, fill, stroke });
+                case 'light_flare':
+                    return new ol.style.RegularShape({ points: 4, radius: spec.radius || 6, radius2: 2, fill, stroke, angle: Math.PI / 4 });
+                case 'range_circle':
+                    return new ol.style.Circle({
+                        radius: spec.radius || 18,
+                        fill: new ol.style.Fill({ color: 'rgba(0,0,0,0)' }),
+                        stroke: new ol.style.Stroke({
+                            color: spec.stroke || '#f4da48',
+                            width: spec.strokeWidth || 2,
+                        }),
+                    });
+                default:
+                    return new ol.style.Circle({ radius: spec.radius || 5, fill, stroke });
+            }
+        }
+
+        _lightSectorGeometries(center, sec) {
+            const start = sec.sectr1;
+            const end = sec.sectr2;
+            if (!Number.isFinite(start) || !Number.isFinite(end)) return [];
+            let sweep = end - start;
+            if (sweep < 0) sweep += 360;
+            if (sweep <= 0) return [];
+            const lonLat = ol.proj.toLonLat(center);
+            const startRad = (start * Math.PI) / 180;
+            const sweepRad = (sweep * Math.PI) / 180;
+
+            if (sweep >= 359.5 && !sec.legs) {
+                const circle = ol.geom.Polygon.circular(lonLat, sec.radiusM, 128);
+                circle.transform('EPSG:4326', 'EPSG:3857');
+                return [circle];
+            }
+
+            const steps = Math.max(64, Math.ceil(sweep / 2));
+            const arcCoords = [];
+            for (let i = 0; i <= steps; i++) {
+                const bearing = startRad + (sweepRad * i) / steps;
+                arcCoords.push(ol.proj.fromLonLat(ol.sphere.offset(lonLat, sec.radiusM, bearing)));
+            }
+            const geoms = [new ol.geom.LineString(arcCoords)];
+            if (sec.legs) {
+                geoms.push(new ol.geom.LineString([
+                    center,
+                    ol.proj.fromLonLat(ol.sphere.offset(lonLat, sec.radiusM, startRad)),
+                ]));
+                geoms.push(new ol.geom.LineString([
+                    center,
+                    ol.proj.fromLonLat(ol.sphere.offset(lonLat, sec.radiusM, startRad + sweepRad)),
+                ]));
+            }
+            return geoms;
+        }
+
+        _autoLabels(layer, props, resolution) {
+            const labels = [];
+            const name = props.NOBJNM || props.OBJNAM;
+            const push = (text, opts = {}) => {
+                if (!text) return;
+                labels.push({
+                    text: String(text),
+                    color: this.color(opts.color || 'CHBLK'),
+                    size: opts.size || 10,
+                    offsetX: opts.offsetX || 0,
+                    offsetY: opts.offsetY || 14,
+                    fontWeight: opts.fontWeight || 'normal',
+                });
+            };
+            if (layer === 'LIGHTS') {
+                if (this.settings.showLightDescriptions && resolution < 900) {
+                    push(this._lightCharText(props), { size: 9, offsetY: 14, color: 'CHBLK' });
+                }
+                if (this.settings.showBuoyLightLabels && name && resolution < 1200) {
+                    push(name, { size: 8, offsetY: 22 });
+                }
+                return labels;
+            }
+            if (layer === 'WRECKS') {
+                if (resolution < 1200) push('Wk', { size: 9, offsetY: 10, fontWeight: 'bold' });
+                if (this.settings.showText && name && resolution < 400) push(name, { size: 8, offsetY: 24 });
+                return labels;
+            }
+            if (/^BOY|^BCN/.test(layer)) {
+                if (this.settings.showBuoyLightLabels && name && resolution < 800) {
+                    push(name, { size: 9, offsetY: 14 });
+                }
+                return labels;
+            }
+            if (!this.settings.showText) return labels;
+            if (layer === 'LNDMRK' && resolution < 1200 && name) push(name, { size: 9 });
+            if (layer === 'LNDRGN' && resolution < 1500 && name) push(name, { size: 11, offsetY: 0 });
+            if (layer === 'SEAARE' && resolution < 1500 && name) push(name, { size: 11, offsetY: 0, font: 'italic' });
+            if (layer === 'BUAARE' && resolution < 1200 && name) push(name, { size: 10, offsetY: 0 });
+            if (layer === 'ACHBRT' && resolution < 800 && name) push(name, { size: 9, offsetY: 0, color: 'CHMGD' });
+            if (layer === 'RESARE' && resolution < 800 && name) push(name, { size: 9, offsetY: 0, color: 'CHMGD' });
+            if (layer === 'FAIRWY' && resolution < 1000 && name) push(name, { size: 9, color: 'CHGRD' });
+            if (layer === 'TSSLPT' && resolution < 1000 && name) push(name, { size: 9, color: 'CHMGD' });
+            if (layer === 'DEPARE' && resolution < 2000 && name) push(name, { size: 10, color: 'CHBLK' });
+            if (layer === 'LNDELV' && resolution < 500) {
+                const e = num(props.ELEVAT);
+                if (!isNaN(e)) push(String(Math.round(e)), { size: 9, offsetY: 0, color: 'LANDF' });
+            }
+            return labels;
+        }
+
+        _lightCharText(props) {
+            const litchr = num(props.LITCHR);
+            const siggrp = props.SIGGRP ? String(props.SIGGRP).replace(/[()]/g, '') : '';
+            const colour = parseColourList(props)[0];
+            const sigper = num(props.SIGPER);
+            const valnmr = num(props.VALNMR);
+            const height = num(props.HEIGHT);
+            const imperial = this.settings.imperialLightText;
+            const chrMap = {
+                1: 'F', 2: 'Fl', 3: 'LFl', 4: 'Q', 5: 'VQ', 6: 'UQ',
+                7: 'Iso', 8: 'Oc', 9: 'IQ', 10: 'IVQ', 11: 'IUQ',
+                12: 'Mo', 13: 'FFl', 14: 'Fl+LFl', 15: 'OcFl',
+                16: 'FLFl', 17: 'AlOc', 18: 'AlLFl', 19: 'AlFl',
+                20: 'AlGp', 25: 'Q+LFl', 26: 'VQ+LFl', 27: 'UQ+LFl',
+                28: 'Al', 29: 'AlFFl',
+            };
+            const colMap = { 1: 'W', 3: 'R', 4: 'G', 5: 'Bu', 6: 'Y', 9: 'Or', 11: 'Y', 12: 'Vi' };
+            let text = chrMap[litchr] || '';
+            if (siggrp && siggrp !== '1') text += `(${siggrp})`;
+            const colStr = colMap[colour] || '';
+            if (colStr) text += (text ? ' ' : '') + colStr;
+            if (!isNaN(sigper) && sigper > 0) text += ` ${sigper}s`;
+            if (!isNaN(height) && height > 0) {
+                text += imperial
+                    ? ` ${Math.round(height * 3.28084)}ft`
+                    : ` ${Math.round(height)}m`;
+            }
+            if (!isNaN(valnmr) && valnmr > 0) {
+                text += imperial ? ` ${valnmr}Nm` : ` ${valnmr}M`;
+            }
+            return text.trim();
         }
     }
 
