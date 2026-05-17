@@ -221,6 +221,7 @@
                 const allAreChecked = Array.from(allChecked).every(c => c.checked);
                 allCb.checked = allAreChecked;
             }
+            if (preslibReady) s52._styleCache = {};
             vectorLayer.changed();
         });
     });
