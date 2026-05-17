@@ -1,0 +1,13 @@
+cache/
+.claude/
+.git/
+__pycache__/
+*.pyc
+.venv/
+venv/
+DOCUMENTATION.md
+Dockerfile
+render.yaml
+server.py
+scripts/
+public/
