@@ -9,38 +9,54 @@ echo   S-57 Viewer - Git commit and push
 echo ========================================
 echo.
 
+git status -sb
+echo.
 git status --short
 echo.
 
+git status --porcelain | findstr /r "." >nul 2>&1
+if errorlevel 1 goto nochanges
+
 if "%~1"=="" goto askmsg
 set "MSG=%*"
-goto domsg
+goto docommit
 
 :askmsg
 set /p MSG=Commit message: 
-
-:domsg
 if "%MSG%"=="" goto empty
 
+:docommit
 git add -A
 git diff --cached --quiet
-if errorlevel 1 goto docommit
-echo No staged changes. Push only.
+if errorlevel 1 goto commit
+echo WARN: git add done but nothing staged.
 goto dopush
 
-:docommit
+:commit
 echo Commit: %MSG%
 git commit -m "%MSG%"
 if errorlevel 1 goto commitfail
 
 :dopush
+echo.
 echo Push to origin...
 git push -u origin HEAD
 if errorlevel 1 goto pushfail
+echo.
+echo Done. Remote is up to date.
+goto end
 
-echo Done.
-pause
-exit /b 0
+:nochanges
+echo INFO: No file changes. Commit skipped.
+echo Latest on this PC:
+git log -1 --oneline
+echo.
+echo Push to origin...
+git push -u origin HEAD
+if errorlevel 1 goto pushfail
+echo.
+echo Done. Nothing new to commit or push.
+goto end
 
 :nogit
 echo ERROR: Not a git repository.
@@ -61,3 +77,7 @@ exit /b 1
 echo ERROR: Push failed. Check remote and login.
 pause
 exit /b 1
+
+:end
+pause
+exit /b 0

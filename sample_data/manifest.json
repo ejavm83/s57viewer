@@ -1,9 +1,9 @@
 {
   "sets": [
     {
-      "id": "korea-demo",
-      "name": "Korea — Jeju approach (demo)",
-      "description": "Five ENC cells (bands 2–3) around southern Korea and Jeju. Bundled for quick testing; not for navigation.",
+      "id": "korea-regional",
+      "name": "Korea — peninsula overview (demo)",
+      "description": "33 ENC cells (bands 1–2): Yellow Sea, south coast, East Sea. Matches regional demo extent; not for navigation.",
       "region": "KR"
     }
   ]

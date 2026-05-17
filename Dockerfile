@@ -12,7 +12,10 @@ RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
 COPY server.py .
 COPY scripts/ scripts/
 COPY public/ public/
+COPY sample_data/ sample_data/
 COPY static/ static/
+
+ENV DEFAULT_SAMPLE_DIR=/app/sample_data/korea-regional
 
 ENV PORT=10000
 EXPOSE 10000

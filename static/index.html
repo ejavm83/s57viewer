@@ -17,7 +17,7 @@
                 <path d="M13 12 Q20 8 27 12 Q30 16 27 20 Q20 24 13 20 Q10 16 13 12Z" fill="#2196F3" opacity="0.6"/>
             </svg>
             <span class="app-title">S-57 Web Viewer</span>
-            <span class="app-version">v0.0.1</span>
+            <span class="app-version">v0.0.2</span>
         </a>
         <div class="top-controls">
             <nav class="header-nav-links" aria-label="Main navigation">
@@ -41,7 +41,7 @@
                 <h3 class="section-title">Chart Data</h3>
                 <button type="button" class="btn-load-folder" id="btn-browse-folder">Select folder</button>
                 <div id="datasource-status" class="datasource-status" aria-live="polite">
-                    <span id="datasource-path" class="datasource-path">Loading sample charts…</span>
+                    <span id="datasource-path" class="datasource-path">Loading demo charts…</span>
                     <span id="datasource-count" class="datasource-count"></span>
                 </div>
             </div>
@@ -144,7 +144,7 @@
                     <p><span class="about-label">Author</span> Kim Kilyong</p>
                     <p><span class="about-label">Contact</span> <a href="mailto:ejavm83@gmail.com">ejavm83@gmail.com</a></p>
                     <p><span class="about-label">Affiliation</span> Korea Maritime University</p>
-                    <p><span class="about-label">Version</span> v0.0.1</p>
+                    <p><span class="about-label">Version</span> v0.0.2</p>
                     <p><span class="about-label">Release</span> 17 May 2026</p>
                     <p><span class="about-label">Visitors today</span> <span id="visitor-today">—</span></p>
                     <p><span class="about-label">Total visitors</span> <span id="visitor-total">—</span></p>
@@ -172,7 +172,7 @@
                 <span class="disclaimer-text">This map cannot be used for navigational purposes. Please use this for test only</span>
             </div>
             <div id="mouse-position"></div>
-            <div id="loading-indicator" class="hidden" role="status" aria-live="polite" aria-busy="true">
+            <div id="loading-indicator" role="status" aria-live="polite" aria-busy="true">
                 <div class="spinner"></div>
                 <div class="loading-content">
                     <span id="loading-message">Loading charts...</span>
@@ -193,6 +193,6 @@
 
     <script src="https://cdn.jsdelivr.net/npm/ol@10.5.0/dist/ol.js"></script>
     <script src="s52-preslib.js"></script>
-    <script src="app.js"></script>
+    <script src="app.js?v=3"></script>
 </body>
 </html>

@@ -35,7 +35,7 @@ Windows에서는 `uvicorn` 명령이 PATH에 없을 수 있으므로 `python -m 
 1. [Render Dashboard](https://dashboard.render.com) → **New** → **Blueprint** → GitHub `ejavm83/s57viewer` 연결
 2. 배포 URL 예: `https://s57viewer.onrender.com`
 
-**Free 플랜** (`render.yaml` 기본): Persistent Disk를 쓸 수 없습니다. 뷰어 UI에서 S-57 폴더 **업로드**로 데이터를 넣거나, 이미지에 포함된 `public/sample` 샘플을 사용합니다. 캐시는 `/tmp/cache`(재시작 시 초기화)입니다.
+**Free 플랜** (`render.yaml` 기본): Persistent Disk를 쓸 수 없습니다. Docker 이미지에는 `sample_data/korea-regional`(한반도 연안·대양 밴드 1–2, 33셀·약 17MB)이 포함됩니다. 더 넓은 데이터는 UI **업로드**로 넣을 수 있습니다. 캐시는 `/tmp/cache`(재시작 시 초기화)입니다.
 
 **Starter 이상 + 전체 해도 상주**가 필요하면 Blueprint에서 `plan: starter`로 바꾸고 `disk`·`S57_DIR`를 추가합니다:
 

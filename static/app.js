@@ -23,6 +23,15 @@
     let preslibReady = false;
     let datasourceReady = false;
     let datasourceLoadActive = false;
+    let mapDisplayReady = false;
+    let chartLoadToken = 0;
+    let lastDatasourceBounds = null;
+    let indexedChartCount = 0;
+    let viewportRetryDone = false;
+    let mapReadyForPanLoad = false;
+    let isFittingView = false;
+    /** Tighter focus than full ENC extent — matches peninsula demo view. */
+    const KOREA_FOCUS_BOUNDS = [118, 32, 132, 42];
 
     function isLayerVisible(layerName) {
         for (const [cat, layers] of Object.entries(CATEGORIES)) {
@@ -127,12 +136,35 @@
         return Math.round(map.getView().getZoom());
     }
 
+    function waitForNextMapRender(timeoutMs) {
+        const limit = timeoutMs == null ? 10000 : timeoutMs;
+        return new Promise(function (resolve) {
+            let settled = false;
+            const finish = function () {
+                if (settled) return;
+                settled = true;
+                ol.Observable.unByKey(listenerKey);
+                clearTimeout(timer);
+                resolve();
+            };
+            const listenerKey = map.once('rendercomplete', finish);
+            const timer = setTimeout(finish, limit);
+            map.render();
+        });
+    }
+
+    function tryLoadCharts() {
+        if (!datasourceReady) return;
+        loadCharts();
+    }
+
     async function loadCharts() {
         if (!datasourceReady) return;
 
-        if (loadingAbort) loadingAbort.abort();
+        if (mapReadyForPanLoad && loadingAbort) loadingAbort.abort();
         loadingAbort = new AbortController();
         const signal = loadingAbort.signal;
+        const token = ++chartLoadToken;
 
         const extent = map.getView().calculateExtent(map.getSize());
         const [west, south] = ol.proj.toLonLat([extent[0], extent[1]]);
@@ -144,27 +176,36 @@
             vectorSource.clear();
             updateInfo(0, 0);
             renderViewportReport(null);
+            mapDisplayReady = true;
             showLoading(false);
             return;
         }
 
         showLoading(true);
         updateProgressUI({
-            message: 'Loading chart features for map…',
+            message: mapDisplayReady ? 'Updating chart display…' : 'Loading chart features for map…',
             percent: null,
             detail: `Zoom ${zoom}`,
             indeterminate: true,
         });
 
+        const fetchTimeoutMs = 90000;
+        let abortedByTimeout = false;
+        const timeoutId = setTimeout(function () {
+            abortedByTimeout = true;
+            if (!signal.aborted) loadingAbort.abort();
+        }, fetchTimeoutMs);
+
         try {
             const url = `/api/charts?west=${west}&south=${south}&east=${east}&north=${north}&zoom=${zoom}&layers=${visibleLayers.join(',')}`;
             const resp = await fetch(url, { signal });
-            if (signal.aborted) return;
+            if (signal.aborted || token !== chartLoadToken) return;
             if (!resp.ok) {
                 const err = await resp.json().catch(() => ({}));
                 throw new Error(err.detail || resp.statusText);
             }
             const data = await resp.json();
+            if (signal.aborted || token !== chartLoadToken) return;
 
             vectorSource.clear();
 
@@ -178,19 +219,75 @@
             currentFeatures = data;
             updateInfo(data.meta.charts_loaded, data.meta.total_features);
             renderViewportReport(data.meta);
+
+            updateProgressUI({
+                message: 'Rendering chart on map…',
+                percent: null,
+                detail: data.meta.total_features
+                    ? `${data.meta.total_features.toLocaleString()} features`
+                    : `Zoom ${zoom}`,
+                indeterminate: true,
+            });
+
+            if (signal.aborted || token !== chartLoadToken) return;
+            await waitForNextMapRender();
+            if (signal.aborted || token !== chartLoadToken) return;
+
+            mapDisplayReady = true;
+            mapReadyForPanLoad = true;
+
+            if (
+                !viewportRetryDone
+                && indexedChartCount > 0
+                && (data.meta.charts_matched || 0) === 0
+                && lastDatasourceBounds
+            ) {
+                viewportRetryDone = true;
+                fitMapToBounds(pickDisplayBounds(lastDatasourceBounds), tryLoadCharts);
+            }
         } catch (e) {
-            if (e.name !== 'AbortError') {
+            if (e.name === 'AbortError' && abortedByTimeout && token === chartLoadToken) {
+                updateProgressUI({
+                    message: 'Chart load timed out',
+                    percent: null,
+                    detail: 'Try zooming in or reducing display layers',
+                    indeterminate: true,
+                });
+            } else if (e.name !== 'AbortError') {
                 console.error('Failed to load charts:', e);
+                updateProgressUI({
+                    message: 'Could not load chart display',
+                    percent: null,
+                    detail: e.message || '',
+                    indeterminate: true,
+                });
             }
         } finally {
-            showLoading(false);
+            clearTimeout(timeoutId);
+            if (token === chartLoadToken && !signal.aborted) {
+                showLoading(false);
+            }
+            if (!mapReadyForPanLoad && datasourceReady && !isFittingView) {
+                mapReadyForPanLoad = true;
+            }
         }
     }
 
     function debouncedLoad() {
-        if (!datasourceReady) return;
+        if (!datasourceReady || !mapReadyForPanLoad || isFittingView) return;
         if (loadDebounce) clearTimeout(loadDebounce);
         loadDebounce = setTimeout(loadCharts, 400);
+    }
+
+    function pickDisplayBounds(bounds) {
+        if (!bounds || bounds.length !== 4) return KOREA_FOCUS_BOUNDS;
+        const [w, s, e, n] = bounds;
+        const spanLon = e - w;
+        const spanLat = n - s;
+        if (spanLon > 35 || spanLat > 35 || spanLon < 0 || spanLat < 0) {
+            return KOREA_FOCUS_BOUNDS;
+        }
+        return bounds;
     }
 
     function escapeHtml(text) {
@@ -378,37 +475,52 @@
     }
 
     function fitMapToBounds(bounds, onComplete) {
-        if (!bounds || bounds.length !== 4) {
+        const displayBounds = pickDisplayBounds(bounds);
+        if (!displayBounds || displayBounds.length !== 4) {
             if (onComplete) onComplete();
             return;
         }
-        const extent = ol.proj.transformExtent(bounds, 'EPSG:4326', 'EPSG:3857');
+        isFittingView = true;
+        mapReadyForPanLoad = false;
+        const extent = ol.proj.transformExtent(displayBounds, 'EPSG:4326', 'EPSG:3857');
         const view = map.getView();
-        if (onComplete) {
-            const listenerKey = map.once('moveend', onComplete);
-            view.fit(extent, { padding: [40, 40, 40, 40], maxZoom: 12, duration: 600 });
-            if (!view.getAnimating()) {
-                ol.Observable.unByKey(listenerKey);
-                onComplete();
-            }
-        } else {
-            view.fit(extent, { padding: [40, 40, 40, 40], maxZoom: 12, duration: 600 });
+        const finish = () => {
+            isFittingView = false;
+            if (onComplete) onComplete();
+        };
+        const listenerKey = map.once('moveend', () => {
+            ol.Observable.unByKey(listenerKey);
+            setTimeout(finish, 50);
+        });
+        view.fit(extent, { padding: [40, 40, 40, 40], maxZoom: 9, duration: 500 });
+        if (!view.getAnimating()) {
+            ol.Observable.unByKey(listenerKey);
+            setTimeout(finish, 50);
         }
     }
 
     function onDatasourceLoaded(data) {
         datasourceReady = true;
+        mapReadyForPanLoad = false;
+        indexedChartCount = data.chart_count || 0;
+        lastDatasourceBounds = data.bounds || null;
+        viewportRetryDone = false;
         updateDatasourceUI(data);
         fetchAndRenderFolderReport(data.report);
-        showLoading(false);
         map.updateSize();
-        const loadWhenReady = () => {
-            if (preslibReady) loadCharts();
+        updateProgressUI({
+            message: preslibReady ? 'Preparing chart display…' : 'Loading chart symbology (S-52)…',
+            percent: null,
+            detail: data.chart_count ? `${data.chart_count} chart(s) ready` : '',
+            indeterminate: true,
+        });
+        const afterFit = () => {
+            setTimeout(tryLoadCharts, 150);
         };
-        if (data.bounds) {
-            fitMapToBounds(data.bounds, loadWhenReady);
+        if (indexedChartCount > 0) {
+            fitMapToBounds(data.bounds || KOREA_FOCUS_BOUNDS, afterFit);
         } else {
-            loadWhenReady();
+            afterFit();
         }
     }
 
@@ -506,10 +618,8 @@
             if (data.status === 'started') {
                 const result = await waitForDatasourceLoad();
                 onDatasourceLoaded(result);
-                if (!preslibReady) showLoading(false);
             } else if (data.loaded) {
                 onDatasourceLoaded(data);
-                if (!preslibReady) showLoading(false);
             }
         } catch (e) {
             console.error(e);
@@ -521,11 +631,18 @@
         }
     }
 
+    function normalizePath(p) {
+        return String(p || '').replace(/\\/g, '/').toLowerCase().replace(/\/$/, '');
+    }
+
     function isDefaultSampleLoaded(data) {
-        return data
-            && data.loaded
-            && data.mode === 'default'
-            && data.includes_default_sample;
+        if (!data || !data.loaded || data.mode !== 'default' || !data.includes_default_sample) {
+            return false;
+        }
+        const expected = normalizePath(data.default_sample_dir);
+        const current = normalizePath(data.path);
+        if (!expected || !current) return true;
+        return current === expected;
     }
 
     async function waitForDefaultSampleReady() {
@@ -541,16 +658,18 @@
         datasourceLoadActive = true;
         setDatasourceButtonsDisabled(true);
         showLoading(true);
-        updateProgressUI({
-            message: 'Loading default sample charts…',
-            percent: null,
-            detail: 'public/sample',
-            indeterminate: true,
-        });
-
         try {
             const dsResp = await fetch('/api/datasource');
             const ds = await dsResp.json();
+            const sampleLabel = ds.default_sample_dir
+                ? ds.default_sample_dir.split(/[/\\]/).pop()
+                : 'sample';
+            updateProgressUI({
+                message: 'Loading default sample charts…',
+                percent: null,
+                detail: sampleLabel,
+                indeterminate: true,
+            });
 
             if (isDefaultSampleLoaded(ds)) {
                 onDatasourceLoaded(ds);
@@ -589,9 +708,11 @@
 
     function showLoading(show) {
         const el = document.getElementById('loading-indicator');
+        const container = document.getElementById('map-container');
         if (!el) return;
         el.classList.toggle('hidden', !show);
         el.setAttribute('aria-busy', show ? 'true' : 'false');
+        if (container) container.classList.toggle('map-loading', show);
     }
 
     function setLoadingMessage(text) {
@@ -724,6 +845,14 @@
     });
 
     async function initPreslib() {
+        if (!datasourceReady) {
+            updateProgressUI({
+                message: 'Loading chart symbology (S-52)…',
+                percent: null,
+                detail: '',
+                indeterminate: true,
+            });
+        }
         try {
             await s52.load('/s52-preslib.json');
             preslibReady = true;
@@ -731,11 +860,23 @@
             document.getElementById('map').style.backgroundColor = sea;
             updateLegendColors();
             vectorLayer.changed();
-            if (datasourceReady) loadCharts();
+            if (datasourceReady) {
+                if (!mapDisplayReady) {
+                    updateProgressUI({
+                        message: 'Preparing chart display…',
+                        percent: null,
+                        detail: '',
+                        indeterminate: true,
+                    });
+                }
+                tryLoadCharts();
+            }
         } catch (e) {
             console.error('S-52 PresLib load failed:', e);
             document.getElementById('map').style.backgroundColor = '#9fc5e8';
-            if (datasourceReady) loadCharts();
+            preslibReady = true;
+            vectorLayer.changed();
+            if (datasourceReady) tryLoadCharts();
         }
     }
 
@@ -775,6 +916,14 @@
 
     map.updateSize();
     window.addEventListener('resize', () => map.updateSize());
+
+    showLoading(true);
+    updateProgressUI({
+        message: 'Starting chart viewer…',
+        percent: null,
+        detail: '',
+        indeterminate: true,
+    });
 
     initPreslib();
     ensureDefaultSampleOnConnect();

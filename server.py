@@ -24,10 +24,30 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 S57_DIR: Path | None = Path(os.environ["S57_DIR"]) if os.environ.get("S57_DIR") else None
 CACHE_DIR = Path(os.environ.get("CACHE_DIR", Path(__file__).parent / "cache"))
-DEFAULT_SAMPLE_DIR = Path(
-    os.environ.get("DEFAULT_SAMPLE_DIR", Path(__file__).parent / "public" / "sample")
-)
 SAMPLE_DATA_DIR = Path(os.environ.get("SAMPLE_DATA_DIR", Path(__file__).parent / "sample_data"))
+
+
+def _dir_has_charts(root: Path) -> bool:
+    return root.is_dir() and any(root.rglob("*.000"))
+
+
+def _resolve_default_sample_dir() -> Path:
+    """Prefer the small bundled demo set (korea-regional) over the full public/sample ENC."""
+    base = Path(__file__).parent
+    regional = base / "sample_data" / "korea-regional"
+    if _dir_has_charts(regional):
+        return regional
+    legacy = base / "public" / "sample"
+    if _dir_has_charts(legacy):
+        return legacy
+    return regional
+
+
+DEFAULT_SAMPLE_DIR = (
+    Path(os.environ["DEFAULT_SAMPLE_DIR"])
+    if os.environ.get("DEFAULT_SAMPLE_DIR")
+    else _resolve_default_sample_dir()
+)
 UPLOAD_DIR = CACHE_DIR / "uploads"
 chart_source_dirs: list[Path] = []
 datasource_mode: str = "default"
@@ -191,7 +211,7 @@ def list_sample_datasets() -> list[dict]:
         if chart_count > 0:
             samples.append({
                 "id": "default",
-                "name": "Default sample (public/sample)",
+                "name": f"Default sample ({DEFAULT_SAMPLE_DIR.name})",
                 "description": "Bundled ENC — auto-loaded on startup",
                 "chart_count": chart_count,
                 "available": True,
@@ -893,7 +913,9 @@ def read_s57_layer(filepath: str, layer: str):
 
 @app.on_event("startup")
 async def startup():
-    """Always load bundled public/sample on server start."""
+    """Load bundled sample charts on start (skip when SKIP_STARTUP_CHART_LOAD=1)."""
+    if os.environ.get("SKIP_STARTUP_CHART_LOAD", "").lower() in ("1", "true", "yes"):
+        return
     if DEFAULT_SAMPLE_DIR.is_dir() and find_chart_files(DEFAULT_SAMPLE_DIR):
         _start_datasource_load(None, mode="default")
 
