@@ -1,0 +1,23 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "",
+  "outputDirectory": "static",
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://s57viewer.onrender.com/api/:path*"
+    },
+    {
+      "source": "/public/:path*",
+      "destination": "https://s57viewer.onrender.com/public/:path*"
+    }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "Access-Control-Allow-Origin", "value": "*" }
+      ]
+    }
+  ]
+}

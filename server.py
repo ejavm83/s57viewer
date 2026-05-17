@@ -17,8 +17,9 @@ from pyogrio.raw import read as ogr_read
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-S57_DIR = Path(r"C:\Users\kimkilyong\Documents\S57_KR전자해도(20240621)")
-CACHE_DIR = Path(__file__).parent / "cache"
+_DEFAULT_S57_DIR = Path(r"C:\Users\kimkilyong\Documents\S57_KR전자해도(20240621)")
+S57_DIR = Path(os.environ.get("S57_DIR", _DEFAULT_S57_DIR))
+CACHE_DIR = Path(os.environ.get("CACHE_DIR", Path(__file__).parent / "cache"))
 CACHE_DIR.mkdir(exist_ok=True)
 
 FEATURE_LAYERS = [
@@ -205,6 +206,10 @@ def get_scale_from_filename(filename: str) -> int:
 
 def build_chart_index():
     global chart_index
+    if not S57_DIR.is_dir():
+        print(f"S57_DIR not found, skipping index build: {S57_DIR}")
+        return
+
     cache_path = CACHE_DIR / "chart_index.json"
 
     if cache_path.exists():
@@ -446,4 +451,5 @@ app.mount("/", StaticFiles(directory=str(_static), html=True), name="static")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    port = int(os.environ.get("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port)

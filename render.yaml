@@ -1,0 +1,18 @@
+# Render Blueprint: https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: s57viewer
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/categories
+    envVars:
+      - key: S57_DIR
+        value: /data/s57
+      - key: CACHE_DIR
+        value: /data/cache
+      - key: PYTHONUNBUFFERED
+        value: "1"
+    disk:
+      name: s57-data
+      mountPath: /data
+      sizeGB: 10
