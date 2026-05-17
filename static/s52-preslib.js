@@ -19,6 +19,11 @@
 
     const LINE_DASH = { SOLD: null, DASH: [8, 4], DOTT: [2, 3] };
 
+    /** Point layers that are label/meta only — never draw default dots. */
+    const HIDDEN_POINT_LAYERS = new Set([
+        'LNDRGN', 'LNDELV', 'M_COVR', 'M_QUAL', 'SEAARE', 'SBDARE', 'UNSARE',
+    ]);
+
     function withAlpha(hex, alpha) {
         if (!hex || !hex.startsWith('#') || hex.length < 7) return hex;
         const r = parseInt(hex.slice(1, 3), 16);
@@ -113,6 +118,10 @@
             return cmds;
         }
 
+        _hasDrawableSymbol(cmds) {
+            return cmds.some(c => c.cmd === 'SY' || c.cmd === 'AC' || c.cmd === 'CS' || c.cmd === 'LS');
+        }
+
         applyConditional(proc, props) {
             const s = this.settings;
             switch (proc) {
@@ -142,7 +151,7 @@
                     const shallow = !isNaN(depth) && depth <= s.safetyDepth;
                     return {
                         textColor: this.color(shallow ? 'CHBLK0' : 'DEPCN0'),
-                        textStroke: shallow ? this.color('CHWHT0') : 'rgba(255,255,255,0.7)',
+                        textStroke: shallow ? this.color('CHWHT0') : 'rgba(255,255,255,0.85)',
                         fontWeight: shallow ? 'bold' : 'normal',
                         fontSize: shallow ? 11 : 10,
                     };
@@ -164,9 +173,9 @@
 
         _lightsColors(props) {
             const colour = Number(props.COLOUR);
-            let fill = 'CHYLW0';
-            if (colour === 3) fill = 'CHRED0';
-            else if (colour === 4) fill = 'CHGRN0';
+            let fill = 'LITYW0';
+            if (colour === 3) fill = 'LITRD0';
+            else if (colour === 4) fill = 'LITGN0';
             else if (colour === 1 || colour === 6) fill = 'CHWHT0';
             return { symbolFill: this.color(fill), symbolStroke: this.color('CHBLK0') };
         }
@@ -180,37 +189,37 @@
                 if (colour === 3 || /14|24/.test(symName)) fill = c('CHRED0');
                 else if (colour === 4 || /13|23/.test(symName)) fill = c('CHGRN0');
                 else if (colour === 6) fill = c('CHYLW0');
-                return { kind: 'triangle', fill, stroke: c('CHBLK0'), radius: 7 };
+                return { kind: 'triangle', fill, stroke: c('CHBLK0'), radius: 6 };
             }
             if (/^BCN/.test(symName)) {
                 let fill = c('CHRED0');
                 if (colour === 4) fill = c('CHGRN0');
-                return { kind: 'square', fill, stroke: c('CHBLK0'), radius: 7 };
+                return { kind: 'square', fill, stroke: c('CHBLK0'), radius: 6 };
             }
             if (/^LIGHTS|^LIT/.test(symName)) {
                 const ls = this._lightsColors(props);
-                return { kind: 'light', fill: ls.symbolFill, stroke: ls.symbolStroke, radius: 6 };
+                return { kind: 'light', fill: ls.symbolFill, stroke: ls.symbolStroke, radius: 5 };
             }
             if (/^FOG/.test(symName)) {
                 return { kind: 'circle', fill: c('CHMGD0'), stroke: c('CHBLK0'), radius: 5 };
             }
             if (/FOULGND|OBSTRN/.test(symName)) {
-                return { kind: 'star', fill: c('CHBLK0'), stroke: c('CHBLK0'), radius: 6 };
+                return { kind: 'star', fill: c('CHBLK0'), stroke: c('CHBLK0'), radius: 5 };
             }
             if (/WRECK/.test(symName)) {
-                return { kind: 'cross', fill: c('CHBLK0'), stroke: c('CHBLK0'), radius: 7 };
+                return { kind: 'cross', fill: c('CHBLK0'), stroke: c('CHBLK0'), radius: 6 };
             }
             if (/ACHBRT|ACHARE/.test(symName)) {
-                return { kind: 'circle', fill: c('CHMGD0'), stroke: c('CHMGF0'), radius: 6 };
+                return { kind: 'circle', fill: c('CHMGD0'), stroke: c('CHMGF0'), radius: 5 };
             }
-            if (/LNDARE|LNDMRK/.test(symName)) {
-                return { kind: 'triangle', fill: c('CHBRN0'), stroke: c('CHBLK0'), radius: 6 };
+            if (/LNDMRK/.test(symName)) {
+                return { kind: 'triangle', fill: c('CHBRN0'), stroke: c('CHBLK0'), radius: 5 };
             }
-            return { kind: 'circle', fill: c('CHBLK0'), stroke: c('CHGRD0'), radius: 4 };
+            return null;
         }
 
         _buildSymbol(spec) {
-            const stroke = new ol.style.Stroke({ color: spec.stroke, width: 1.5 });
+            const stroke = new ol.style.Stroke({ color: spec.stroke, width: 1.2 });
             const fill = new ol.style.Fill({ color: spec.fill });
             switch (spec.kind) {
                 case 'triangle':
@@ -221,10 +230,19 @@
                     return new ol.style.RegularShape({ points: 5, radius: spec.radius, radius2: spec.radius / 2, fill, stroke });
                 case 'cross':
                     return new ol.style.Text({
-                        text: '✕',
+                        text: '\u2715',
                         font: `bold ${spec.radius * 2}px sans-serif`,
                         fill: new ol.style.Fill({ color: spec.fill }),
-                        stroke: new ol.style.Stroke({ color: 'rgba(255,255,255,0.8)', width: 1.5 }),
+                        stroke: new ol.style.Stroke({ color: 'rgba(255,255,255,0.85)', width: 1.5 }),
+                    });
+                case 'light':
+                    return new ol.style.RegularShape({
+                        points: 4,
+                        radius: spec.radius,
+                        radius2: 2,
+                        fill,
+                        stroke,
+                        angle: Math.PI / 4,
                     });
                 default:
                     return new ol.style.Circle({ radius: spec.radius, fill, stroke });
@@ -239,7 +257,11 @@
             const props = {};
             feature.getKeys().forEach(k => { if (k !== 'geometry') props[k] = feature.get(k); });
 
-            const cacheKey = `${layer}|${geomType}|${resolution | 0}|${props.DRVAL1}|${props.DRVAL2}|${props.VALDCO}|${props.depth}|${props.COLOUR}|${props.CATCOA}|${props.BOYSHP}|${props.BCNSHP}`;
+            if (HIDDEN_POINT_LAYERS.has(layer) && geomType.includes('Point')) {
+                return null;
+            }
+
+            const cacheKey = `${layer}|${geomType}|${resolution | 0}|${props.DRVAL1}|${props.DRVAL2}|${props.VALDCO}|${props.depth}|${props.COLOUR}|${props.BOYSHP}|${props.BCNSHP}`;
             if (this._styleCache[cacheKey] !== undefined) return this._styleCache[cacheKey];
 
             const rule = this.findRule(layer, geomType, props);
@@ -257,7 +279,7 @@
                     if (cs) {
                         if (cs.fill != null) fill = cs.fill;
                         if (cs.stroke) { stroke = cs.stroke; strokeWidth = cs.strokeWidth || 1; lineDash = cs.lineDash; }
-                        if (cs.symbolFill) symbol = { kind: 'light', fill: cs.symbolFill, stroke: cs.symbolStroke, radius: 6 };
+                        if (cs.symbolFill) symbol = { kind: 'light', fill: cs.symbolFill, stroke: cs.symbolStroke, radius: 5 };
                     }
                 } else if (cmd === 'AC') {
                     fill = this.color(args);
@@ -271,14 +293,14 @@
                 }
             }
 
-            const styles = [];
             const isPoly = geomType.includes('Polygon');
             const isLine = geomType.includes('Line');
             const isPoint = geomType.includes('Point');
+            const styles = [];
 
-            if (isPoly) {
+            if (isPoly && fill) {
                 styles.push(new ol.style.Style({
-                    fill: new ol.style.Fill({ color: fill ? withAlpha(fill, 0.85) : 'rgba(0,0,0,0)' }),
+                    fill: new ol.style.Fill({ color: withAlpha(fill, 0.9) }),
                     stroke: stroke ? new ol.style.Stroke({ color: stroke, width: strokeWidth, lineDash: lineDash || undefined }) : undefined,
                 }));
             } else if (isLine && stroke) {
@@ -298,44 +320,22 @@
                     }),
                 }));
             } else if (isPoint && symbol) {
-                if (symbol.kind === 'light') {
-                    const r = resolution < 100 ? 8 : resolution < 500 ? 6 : 4;
-                    styles.push(new ol.style.Style({
-                        image: new ol.style.Circle({
-                            radius: r + 8,
-                            fill: new ol.style.Fill({ color: withAlpha(symbol.fill, 0.15) }),
-                            stroke: new ol.style.Stroke({ color: withAlpha(symbol.fill, 0.35), width: 1 }),
-                        }),
-                    }));
-                }
                 styles.push(new ol.style.Style({ image: this._buildSymbol(symbol) }));
             } else if (isPoint && layer === 'LIGHTS') {
                 const ls = this._lightsColors(props);
-                const r = resolution < 100 ? 8 : resolution < 500 ? 6 : 4;
-                styles.push(
-                    new ol.style.Style({
-                        image: new ol.style.Circle({
-                            radius: r + 8,
-                            fill: new ol.style.Fill({ color: withAlpha(ls.symbolFill, 0.12) }),
-                            stroke: new ol.style.Stroke({ color: withAlpha(ls.symbolFill, 0.3), width: 1 }),
-                        }),
-                    }),
-                    new ol.style.Style({
-                        image: new ol.style.Circle({
-                            radius: r,
-                            fill: new ol.style.Fill({ color: ls.symbolFill }),
-                            stroke: new ol.style.Stroke({ color: ls.symbolStroke, width: 1.5 }),
-                        }),
-                    })
-                );
-            } else if (isPoint) {
+                const r = resolution < 80 ? 6 : resolution < 300 ? 5 : 4;
                 styles.push(new ol.style.Style({
-                    image: new ol.style.Circle({
-                        radius: 4,
-                        fill: new ol.style.Fill({ color: this.color('CHBLK0') }),
-                        stroke: new ol.style.Stroke({ color: this.color('CHGRD0'), width: 1 }),
+                    image: new ol.style.RegularShape({
+                        points: 4,
+                        radius: r,
+                        radius2: 2,
+                        fill: new ol.style.Fill({ color: ls.symbolFill }),
+                        stroke: new ol.style.Stroke({ color: ls.symbolStroke, width: 1.2 }),
+                        angle: Math.PI / 4,
                     }),
                 }));
+            } else if (isPoint && !this._hasDrawableSymbol(cmds)) {
+                return null;
             }
 
             const result = styles.length ? (styles.length === 1 ? styles[0] : styles) : null;

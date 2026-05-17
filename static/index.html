@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ko">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -9,7 +9,7 @@
 </head>
 <body>
     <header id="top-bar">
-        <div class="logo-section">
+        <a href="/" class="logo-section" title="S-57 Web Viewer">
             <svg class="logo-icon" viewBox="0 0 40 40" width="36" height="36">
                 <circle cx="20" cy="20" r="18" fill="none" stroke="#FFB300" stroke-width="2"/>
                 <path d="M20 5 L20 35 M5 20 L35 20" stroke="#FFB300" stroke-width="1" opacity="0.5"/>
@@ -17,8 +17,14 @@
                 <path d="M13 12 Q20 8 27 12 Q30 16 27 20 Q20 24 13 20 Q10 16 13 12Z" fill="#2196F3" opacity="0.6"/>
             </svg>
             <span class="app-title">S-57 Web Viewer</span>
-        </div>
+            <span class="app-version">v0.0.1</span>
+        </a>
         <div class="top-controls">
+            <nav class="header-nav-links" aria-label="Main navigation">
+                <a href="/" class="active">Viewer</a>
+                <a href="/docs.html">Documentation</a>
+                <a href="https://docs.google.com/document/d/1duEzdO5jr04jgnnGRqFvlzImcVOBb6LAvQ2Fp5ufr_Q/edit?usp=sharing" target="_blank" rel="noopener noreferrer">Feedback</a>
+            </nav>
             <label class="toggle-label">
                 <span>Dual Mode</span>
                 <div class="toggle-switch" id="dual-mode-toggle">
@@ -26,12 +32,20 @@
                 </div>
             </label>
             <button class="top-btn" id="btn-disclaimer">Disclaimer</button>
-            <button class="top-btn" id="btn-manual">Manual</button>
         </div>
     </header>
 
     <div id="main-container">
         <aside id="sidebar">
+            <div class="sidebar-section" id="datasource-section">
+                <h3 class="section-title">Chart Data</h3>
+                <button type="button" class="btn-load-folder" id="btn-browse-folder">Select folder</button>
+                <div id="datasource-status" class="datasource-status" aria-live="polite">
+                    <span id="datasource-path" class="datasource-path">Loading sample charts…</span>
+                    <span id="datasource-count" class="datasource-count"></span>
+                </div>
+            </div>
+
             <div class="sidebar-section">
                 <h3 class="section-title">Product List</h3>
                 <div class="product-item active">
@@ -55,51 +69,39 @@
                 <h3 class="section-title">Display Option</h3>
                 <div id="display-options">
                     <label class="display-option">
-                        <span class="option-dot" style="background:#FFB300"></span>
                         <input type="checkbox" data-category="all" checked> Full Display
                     </label>
                     <label class="display-option">
-                        <span class="option-dot" style="background:#8D6E63"></span>
                         <input type="checkbox" data-category="land" checked> Land
                     </label>
                     <label class="display-option">
-                        <span class="option-dot" style="background:#FFEB3B"></span>
                         <input type="checkbox" data-category="light" checked> Light
                     </label>
                     <label class="display-option">
-                        <span class="option-dot" style="background:#F44336"></span>
                         <input type="checkbox" data-category="beacon" checked> Beacon
                     </label>
                     <label class="display-option">
-                        <span class="option-dot" style="background:#4CAF50"></span>
                         <input type="checkbox" data-category="buoy" checked> Buoy
                     </label>
                     <label class="display-option">
-                        <span class="option-dot" style="background:#9C27B0"></span>
                         <input type="checkbox" data-category="obstruction" checked> Obstruction
                     </label>
                     <label class="display-option">
-                        <span class="option-dot" style="background:#E91E63"></span>
                         <input type="checkbox" data-category="wreck" checked> Wreck
                     </label>
                     <label class="display-option">
-                        <span class="option-dot" style="background:#00BCD4"></span>
                         <input type="checkbox" data-category="sounding" checked> Sounding
                     </label>
                     <label class="display-option">
-                        <span class="option-dot" style="background:#3F51B5"></span>
                         <input type="checkbox" data-category="depth" checked> Depth Area
                     </label>
                     <label class="display-option">
-                        <span class="option-dot" style="background:#607D8B"></span>
                         <input type="checkbox" data-category="coastline" checked> Coastline
                     </label>
                     <label class="display-option">
-                        <span class="option-dot" style="background:#FF9800"></span>
                         <input type="checkbox" data-category="navigation" checked> Navigation
                     </label>
                     <label class="display-option">
-                        <span class="option-dot" style="background:#795548"></span>
                         <input type="checkbox" data-category="infrastructure" checked> Infrastructure
                     </label>
                 </div>
@@ -109,24 +111,47 @@
                 <h3 class="section-title">Chart Info</h3>
                 <div id="chart-info">
                     <div class="info-row"><span>Charts loaded:</span><span id="info-charts">0</span></div>
+                    <div class="info-row"><span>Matched in view:</span><span id="info-charts-matched">—</span></div>
                     <div class="info-row"><span>Features:</span><span id="info-features">0</span></div>
                     <div class="info-row"><span>Zoom:</span><span id="info-zoom">-</span></div>
                     <div class="info-row"><span>Scale:</span><span id="info-scale">-</span></div>
                 </div>
+                <details id="viewport-report-details" class="load-report-details viewport-report hidden">
+                    <summary>Map load details</summary>
+                    <div id="viewport-report-body" class="load-report-detail-body"></div>
+                </details>
             </div>
 
             <div class="sidebar-section">
                 <h3 class="section-title">Legend</h3>
                 <div id="legend">
-                    <div class="legend-item"><span class="legend-swatch" style="background:#d4c6a0"></span> Land</div>
-                    <div class="legend-item"><span class="legend-swatch" style="background:#c5dff5"></span> Shallow (&lt;5m)</div>
-                    <div class="legend-item"><span class="legend-swatch" style="background:#9fc5e8"></span> Medium (5-20m)</div>
-                    <div class="legend-item"><span class="legend-swatch" style="background:#6fa8dc"></span> Deep (&gt;20m)</div>
-                    <div class="legend-item"><span class="legend-swatch swatch-circle" style="background:#FFEB3B"></span> Light</div>
-                    <div class="legend-item"><span class="legend-swatch swatch-circle" style="background:#F44336"></span> Beacon</div>
-                    <div class="legend-item"><span class="legend-swatch swatch-circle" style="background:#4CAF50"></span> Buoy</div>
-                    <div class="legend-item"><span class="legend-swatch swatch-x" style="color:#E91E63"></span> Wreck</div>
-                    <div class="legend-item"><span class="legend-swatch swatch-star" style="color:#9C27B0"></span> Obstruction</div>
+                    <div class="legend-item"><span class="legend-swatch"></span> Land (LANDA)</div>
+                    <div class="legend-item"><span class="legend-swatch"></span> Very shallow (DEPVS)</div>
+                    <div class="legend-item"><span class="legend-swatch"></span> Shallow (DEPMS)</div>
+                    <div class="legend-item"><span class="legend-swatch"></span> Medium depth (DEPMD)</div>
+                    <div class="legend-item"><span class="legend-swatch swatch-circle"></span> Light</div>
+                    <div class="legend-item"><span class="legend-swatch swatch-circle"></span> Beacon</div>
+                    <div class="legend-item"><span class="legend-swatch swatch-circle"></span> Buoy</div>
+                    <div class="legend-item"><span class="legend-swatch swatch-x"></span> Wreck</div>
+                    <div class="legend-item"><span class="legend-swatch swatch-star"></span> Obstruction</div>
+                </div>
+                <p class="legend-note">IHO S-52 PresLib e4.0.0 (DAY)</p>
+            </div>
+
+            <div class="sidebar-section app-meta">
+                <h3 class="section-title">About</h3>
+                <div id="app-about" class="app-about">
+                    <p><span class="about-label">Author</span> Kim Kilyong</p>
+                    <p><span class="about-label">Contact</span> <a href="mailto:ejavm83@gmail.com">ejavm83@gmail.com</a></p>
+                    <p><span class="about-label">Affiliation</span> Korea Maritime University</p>
+                    <p><span class="about-label">Version</span> v0.0.1</p>
+                    <p><span class="about-label">Release</span> 17 May 2026</p>
+                    <p><span class="about-label">Visitors today</span> <span id="visitor-today">—</span></p>
+                    <p><span class="about-label">Total visitors</span> <span id="visitor-total">—</span></p>
+                    <p class="about-docs-link">
+                        <a href="/docs.html">User guide &amp; documentation &rarr;</a><br>
+                        <a href="https://github.com/ejavm83/s57viewer" target="_blank" rel="noopener">GitHub &rarr;</a>
+                    </p>
                 </div>
             </div>
         </aside>
@@ -147,9 +172,13 @@
                 <span class="disclaimer-text">This map cannot be used for navigational purposes. Please use this for test only</span>
             </div>
             <div id="mouse-position"></div>
-            <div id="loading-indicator" class="hidden">
+            <div id="loading-indicator" class="hidden" role="status" aria-live="polite" aria-busy="true">
                 <div class="spinner"></div>
-                <span>Loading charts...</span>
+                <div class="loading-content">
+                    <span id="loading-message">Loading charts...</span>
+                    <progress id="loading-progress" class="loading-progress" max="100" value="0"></progress>
+                    <span id="loading-detail" class="loading-detail"></span>
+                </div>
             </div>
         </div>
 

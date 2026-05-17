@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Parse IHO S-52 Presentation Library (.dai) into JSON for the web viewer."""
 
-import colorsys
 import json
 import re
 from pathlib import Path
@@ -12,10 +11,23 @@ DAI_PATH = ROOT / "public" / "PresLib_e4.0.0.dai"
 OUT_PATH = ROOT / "static" / "s52-preslib.json"
 
 
-def hsl_to_hex(h: str, s: str, l: str) -> str:
-    h_f, s_f, l_f = float(h), float(s), float(l) / 100.0
-    r, g, b = colorsys.hls_to_rgb(h_f % 1.0, l_f, s_f)
-    return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
+def xyY_to_hex(x: float, y: float, Y: float) -> str:
+    """Convert S-52 CCIE xyY (x,y chromaticity + luminance 0–100) to sRGB hex."""
+    if y < 1e-6:
+        return "#000000"
+    Yn = Y / 100.0
+    X = x * Yn / y
+    Z = (1.0 - x - y) * Yn / y
+    r = 3.2406 * X + -1.5372 * Yn + -0.4986 * Z
+    g = -0.9689 * X + 1.8758 * Yn + 0.0415 * Z
+    b = 0.0557 * X + -0.2040 * Yn + 1.0570 * Z
+
+    def gamma(v: float) -> float:
+        v = max(0.0, min(1.0, v))
+        return 12.92 * v if v <= 0.0031308 else 1.055 * (v ** (1.0 / 2.4)) - 0.055
+
+    ri, gi, bi = int(gamma(r) * 255), int(gamma(g) * 255), int(gamma(b) * 255)
+    return f"#{ri:02x}{gi:02x}{bi:02x}"
 
 
 def parse_colors(text: str) -> dict:
@@ -33,7 +45,8 @@ def parse_colors(text: str) -> dict:
                 line,
             )
             if m:
-                colors[m.group(1)] = hsl_to_hex(*m.groups()[1:])
+                token = m.group(1)
+                colors[token] = xyY_to_hex(float(m.group(2)), float(m.group(3)), float(m.group(4)))
     return colors
 
 
@@ -76,6 +89,8 @@ def main():
     }
     OUT_PATH.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
     print(f"Wrote {OUT_PATH} ({OUT_PATH.stat().st_size:,} bytes, {len(out['lookups'])} objects)")
+    for t in ("DEPDW0", "DEPMD0", "LANDA0", "CHGRN0", "CHRED0"):
+        print(f"  {t}: {out['colors'].get(t)}")
 
 
 if __name__ == "__main__":

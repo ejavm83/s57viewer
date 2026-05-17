@@ -1,4 +1,6 @@
 # Render Blueprint: https://render.com/docs/blueprint-spec
+# Free tier: no persistent disk — use bundled sample + browser upload API.
+# For full ENC on server disk, use plan: starter and add the disk block (see README).
 services:
   - type: web
     name: s57viewer
@@ -6,13 +8,7 @@ services:
     plan: free
     healthCheckPath: /api/categories
     envVars:
-      - key: S57_DIR
-        value: /data/s57
       - key: CACHE_DIR
-        value: /data/cache
+        value: /tmp/cache
       - key: PYTHONUNBUFFERED
         value: "1"
-    disk:
-      name: s57-data
-      mountPath: /data
-      sizeGB: 10

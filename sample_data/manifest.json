@@ -1,0 +1,10 @@
+{
+  "sets": [
+    {
+      "id": "korea-demo",
+      "name": "Korea — Jeju approach (demo)",
+      "description": "Five ENC cells (bands 2–3) around southern Korea and Jeju. Bundled for quick testing; not for navigation.",
+      "region": "KR"
+    }
+  ]
+}

@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="ko">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>S-57 전자해도 웹 뷰어 - 상세 설명서</title>
+    <title>S-57 ENC Web Viewer - Documentation</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -450,6 +450,7 @@
     <div class="nav-links">
         <a href="/">Viewer</a>
         <a href="/docs.html" class="active">Documentation</a>
+        <a href="https://docs.google.com/document/d/1duEzdO5jr04jgnnGRqFvlzImcVOBb6LAvQ2Fp5ufr_Q/edit?usp=sharing" target="_blank" rel="noopener noreferrer">Feedback</a>
     </div>
 </nav>
 
@@ -473,6 +474,7 @@
             <li class="sub"><a href="#ui-layout">UI Layout</a></li>
             <li class="sub"><a href="#display-options">Display Options</a></li>
             <li class="sub"><a href="#map-controls">Map Controls</a></li>
+            <li class="sub"><a href="#s52-preslib">S-52 PresLib</a></li>
             <li class="sub"><a href="#depth-colors">Depth Colors</a></li>
             <li class="sub"><a href="#render-order">Render Order</a></li>
             <li class="sub"><a href="#legend">Legend</a></li>
@@ -490,402 +492,450 @@
     </aside>
 
     <main class="content">
-        <h1>S-57 전자해도 웹 뷰어</h1>
-        <p class="subtitle">상세 설명서 &mdash; 일반인도 이해할 수 있도록 모든 개념을 풀어서 설명합니다.</p>
+        <h1>S-57 Electronic Nautical Chart Web Viewer</h1>
+        
+        <div class="card-grid about-app" style="margin-bottom:24px">
+            <div class="card">
+                <h4><span class="badge badge-blue">Author</span></h4>
+                <p>Kim Kilyong</p>
+            </div>
+            <div class="card">
+                <h4><span class="badge badge-red">Contact</span></h4>
+                <p><a href="mailto:ejavm83@gmail.com">ejavm83@gmail.com</a></p>
+            </div>
+            <div class="card">
+                <h4><span class="badge badge-green">Affiliation</span></h4>
+                <p>Korea Maritime University</p>
+            </div>
+            <div class="card">
+                <h4><span class="badge badge-yellow">Version</span></h4>
+                <p>v0.0.1</p>
+            </div>
+            <div class="card">
+                <h4><span class="badge badge-purple">Release</span></h4>
+                <p>17 May 2026</p>
+            </div>
+            <div class="card">
+                <h4><span class="badge badge-blue">Source code</span></h4>
+                <p><a href="https://github.com/ejavm83/s57viewer" target="_blank" rel="noopener">github.com/ejavm83/s57viewer</a></p>
+            </div>
+        </div>
+
+        <p class="subtitle">User guide &mdash; concepts explained for a general audience.</p>
 
         <!-- ====== 1. OVERVIEW ====== -->
-        <h2 id="overview">1. 프로젝트 개요</h2>
+        <h2 id="overview">1. Project Overview</h2>
 
-        <h3 id="what-is">이 프로젝트는 무엇인가요?</h3>
-        <p>이 프로젝트는 <strong>대한민국 전자해도(Electronic Navigational Chart) 데이터를 웹 브라우저에서 볼 수 있는 지도 뷰어</strong>입니다.</p>
-        <p>전자해도란 종이 해도(바다 지도)를 디지털화한 것으로, 선박이 안전하게 항해하기 위해 필요한 모든 정보를 담고 있습니다. 바다의 깊이, 등대 위치, 부표(바다 위에 떠 있는 표지), 암초, 침몰 선박, 해안선 등의 정보가 포함됩니다.</p>
+        <h3 id="what-is">What Is This Project?</h3>
+        <p>This project is a <strong>web map viewer for Republic of Korea Electronic Navigational Chart (ENC) data</strong>.</p>
+        <p>An ENC digitizes paper nautical charts. It contains depth, lights, buoys, rocks, wrecks, coastlines, and other information needed for safe navigation.</p>
 
-        <h3 id="s57-format">S-57이란?</h3>
-        <p><strong>S-57</strong>은 국제수로기구(IHO)가 정한 전자해도의 국제 표준 데이터 형식입니다. 전 세계 대부분의 해양 국가가 이 형식으로 전자해도를 제작하며, 선박에 탑재되는 ECDIS(전자해도표시시스템)에서 사용됩니다.</p>
-        <p>S-57 파일은 일반적인 이미지 파일이 아니라 <strong>바이너리 형식의 구조화된 데이터</strong>로, 특수한 소프트웨어 없이는 내용을 볼 수 없습니다. 이 프로젝트는 이러한 S-57 데이터를 일반 웹 브라우저에서 시각적으로 볼 수 있게 변환하여 보여줍니다.</p>
+        <h3 id="s57-format">What Is S-57?</h3>
+        <p><strong>S-57</strong> is the IHO international standard format for ENC data. Most maritime nations publish ENCs in this format for use in ECDIS (Electronic Chart Display and Information Systems).</p>
+        <p>S-57 files are <strong>structured binary data</strong>, not ordinary images. This project converts S-57 data so it can be viewed in a standard web browser.</p>
 
-        <h3 id="data-source">사용되는 데이터</h3>
+        <h3 id="data-source">Data Source</h3>
+        <p>Select a folder containing S-57 <code>.000</code> files in the viewer sidebar (server browse or browser upload), or set <code>S57_DIR</code>. After indexing, <strong>Folder analysis</strong> appears in the sidebar; use <code>GET /api/datasource/report</code> for full details.</p>
         <div class="card-grid">
             <div class="card">
-                <h4><span class="badge badge-blue">출처</span></h4>
-                <p>대한민국 국립해양조사원 발행 전자해도</p>
+                <h4><span class="badge badge-blue">Format</span></h4>
+                <p>IHO S-57 ENC (<code>.000</code>)</p>
             </div>
             <div class="card">
-                <h4><span class="badge badge-green">기준일</span></h4>
-                <p>2024년 6월 21일 (NTM-25)</p>
+                <h4><span class="badge badge-green">Example dataset</span></h4>
+                <p>KHOA ENC, 21 June 2024 (NTM-25) &mdash; ~744 files</p>
             </div>
             <div class="card">
-                <h4><span class="badge badge-yellow">파일 수</span></h4>
-                <p>744개의 해도 파일 (.000 확장자)</p>
+                <h4><span class="badge badge-yellow">Example coverage</span></h4>
+                <p>Republic of Korea (Jeju, Dokdo, Ieodo)</p>
             </div>
             <div class="card">
-                <h4><span class="badge badge-purple">커버리지</span></h4>
-                <p>대한민국 전 해역 (제주도, 독도, 이어도 포함)</p>
+                <h4><span class="badge badge-purple">Rendering</span></h4>
+                <p>IHO S-52 PresLib e4.0.0 (DAY)</p>
             </div>
         </div>
 
         <div class="alert alert-warning">
-            <strong>주의:</strong> 이 뷰어는 교육 및 시연 목적으로만 사용해야 하며, 실제 항해에 사용할 수 없습니다.
+            <strong>Warning:</strong> This viewer is for education and demonstration only. It must not be used for navigation.
         </div>
 
         <!-- ====== 2. ARCHITECTURE ====== -->
-        <h2 id="architecture">2. 시스템 구성</h2>
-        <p>이 프로젝트는 크게 <strong>백엔드(서버)</strong>와 <strong>프론트엔드(화면)</strong> 두 부분으로 나뉩니다.</p>
+        <h2 id="architecture">2. System Architecture</h2>
+        <p>The project consists of a <strong>backend (server)</strong> and a <strong>frontend (browser UI)</strong>.</p>
 
         <div class="diagram">
             <div class="diagram-flow">
                 <div class="diagram-box accent">
-                    <h5>웹 브라우저 (프론트엔드)</h5>
-                    <p>OpenLayers 지도 엔진으로 해안선, 수심, 등대, 부표 등을 렌더링<br>사이드바에서 표시 옵션 제어 / 클릭으로 상세정보 확인</p>
+                    <h5>Web browser (frontend)</h5>
+                    <p>OpenLayers map + <strong>S-52 PresLib e4.0.0</strong> (DAY) styling via <code>s52-preslib.js</code><br>Sidebar display options / click features for details</p>
                 </div>
-                <div class="diagram-arrow">&darr; HTTP 요청 (자동) &uarr; GeoJSON 응답</div>
+                <div class="diagram-arrow">&darr; HTTP request (automatic) &uarr; GeoJSON response</div>
                 <div class="diagram-box blue">
-                    <h5>Python 서버 (백엔드, FastAPI)</h5>
-                    <p>S-57 파일 읽기 (pyogrio/GDAL) &rarr; GeoJSON 변환 &rarr; 캐시 저장 &rarr; API 응답</p>
+                    <h5>Python server (backend, FastAPI)</h5>
+                    <p>Read S-57 (pyogrio/GDAL) &rarr; convert to GeoJSON &rarr; cache &rarr; API response</p>
                 </div>
-                <div class="diagram-arrow">&darr; 파일 읽기</div>
+                <div class="diagram-arrow">&darr; read files</div>
                 <div class="diagram-box green">
-                    <h5>S-57 전자해도 파일 (744개)</h5>
+                    <h5>S-57 ENC files (744)</h5>
                     <p>KR1A0000.000, KR2F2000.000, KR5F4G13.000 ...</p>
                 </div>
             </div>
         </div>
 
-        <h3 id="file-structure">파일 구조</h3>
-        <pre>D:\src\s-57 viewer\
-├── server.py              &larr; 백엔드 서버 (데이터 처리 + API)
-├── static\                &larr; 프론트엔드 파일들
-│   ├── index.html         &larr; 화면 레이아웃 (HTML)
-│   ├── style.css          &larr; 화면 디자인 (CSS)
-│   ├── app.js             &larr; 지도 동작 로직 (JavaScript)
-│   └── docs.html          &larr; 이 설명서 페이지
-├── cache\                 &larr; 변환된 데이터 캐시 (자동 생성)
-│   ├── chart_index.json   &larr; 해도 목록 인덱스
-│   └── *.json             &larr; 각 레이어별 변환 캐시
-└── DOCUMENTATION.md       &larr; 마크다운 설명서</pre>
+        <h3 id="file-structure">File structure</h3>
+        <pre>s57viewer/
+├── server.py
+├── public/PresLib_e4.0.0.dai     &larr; IHO S-52 Presentation Library source
+├── scripts/build_preslib.py      &larr; DAI &rarr; s52-preslib.json
+├── static/
+│   ├── index.html, docs.html, style.css, app.js
+│   ├── s52-preslib.js            &larr; S-52 renderer (LUPT + CS)
+│   └── s52-preslib.json          &larr; parsed PresLib (67 colors, 1164 rules)
+├── cache/                        &larr; chart index + GeoJSON cache
+├── README.md, DOCUMENTATION.md</pre>
 
         <!-- ====== 3. BACKEND ====== -->
-        <h2 id="backend">3. 백엔드 서버 상세</h2>
-        <p>서버는 3가지 핵심 작업을 수행합니다:</p>
+        <h2 id="backend">3. Backend Server</h2>
+        <p>The server performs three core tasks:</p>
         <div class="card-grid">
             <div class="card">
-                <h4>1. S-57 파일 인덱싱</h4>
-                <p>서버 시작 시 744개 파일을 스캔하여 각 파일이 어느 해역을 커버하는지, 어떤 축척인지, 어떤 정보가 들어있는지를 목록으로 만듭니다.</p>
+                <h4>1. S-57 file indexing</h4>
+                <p>On startup the server scans 744 files and builds a list of coverage, scale, and layer content for each chart.</p>
             </div>
             <div class="card">
-                <h4>2. S-57 &rarr; GeoJSON 변환</h4>
-                <p>브라우저가 요청하면 해당 해역의 S-57 파일을 읽어서 웹 지도에서 사용할 수 있는 GeoJSON 형식으로 변환합니다.</p>
+                <h4>2. S-57 &rarr; GeoJSON conversion</h4>
+                <p>When the browser requests data, the server reads the relevant S-57 files and converts them to GeoJSON for the web map.</p>
             </div>
             <div class="card">
-                <h4>3. 웹 페이지 제공</h4>
-                <p>HTML, CSS, JavaScript 파일을 브라우저에 전달합니다.</p>
+                <h4>3. Serve web pages</h4>
+                <p>Delivers HTML, CSS, and JavaScript to the browser.</p>
             </div>
         </div>
 
-        <h3 id="scale-system">해도 축척(Scale) 체계</h3>
-        <p>한국 전자해도 파일명의 <strong>3번째 글자</strong>가 축척 등급을 나타냅니다. <strong>축척</strong>이란 지도에서 1cm가 실제 거리 몇 m에 해당하는지를 나타냅니다. 숫자가 작을수록 더 상세한 지도입니다.</p>
+        <h3 id="scale-system">Chart scale system</h3>
+        <p>In Korean ENC file names, the <strong>third character</strong> is the scale band. <strong>Scale</strong> is the map ratio (e.g. 1:10,000). Smaller denominators mean more detail.</p>
         <table>
-            <thead><tr><th>등급</th><th>파일명 패턴</th><th>대략적 축척</th><th>용도</th><th>예시</th></tr></thead>
+            <thead><tr><th>Band</th><th>Filename pattern</th><th>Approx. scale</th><th>Purpose</th><th>Example</th></tr></thead>
             <tbody>
-                <tr><td><span class="badge badge-blue">1</span></td><td>KR<strong>1</strong>xxxxx</td><td>1:3,500,000</td><td>대양 항해용 (먼 바다 전체)</td><td>KR1F0000.000</td></tr>
-                <tr><td><span class="badge badge-blue">2</span></td><td>KR<strong>2</strong>xxxxx</td><td>1:700,000</td><td>연안 항해용 (해안 근처)</td><td>KR2F2000.000</td></tr>
-                <tr><td><span class="badge badge-green">3</span></td><td>KR<strong>3</strong>xxxxx</td><td>1:180,000</td><td>접근 항해용 (항구 접근)</td><td>KR3F4G00.000</td></tr>
-                <tr><td><span class="badge badge-green">4</span></td><td>KR<strong>4</strong>xxxxx</td><td>1:90,000</td><td>연안 상세</td><td>KR4F4G10.000</td></tr>
-                <tr><td><span class="badge badge-yellow">5</span></td><td>KR<strong>5</strong>xxxxx</td><td>1:22,000</td><td>항만 진입용</td><td>KR5F4G13.000</td></tr>
-                <tr><td><span class="badge badge-yellow">6</span></td><td>KR<strong>6</strong>xxxxx</td><td>1:12,000</td><td>항만 내부 상세</td><td>KR6xxxx.000</td></tr>
+                <tr><td><span class="badge badge-blue">1</span></td><td>KR<strong>1</strong>xxxxx</td><td>1:3,500,000</td><td>Ocean passage (broad coverage)</td><td>KR1F0000.000</td></tr>
+                <tr><td><span class="badge badge-blue">2</span></td><td>KR<strong>2</strong>xxxxx</td><td>1:700,000</td><td>Coastal navigation</td><td>KR2F2000.000</td></tr>
+                <tr><td><span class="badge badge-green">3</span></td><td>KR<strong>3</strong>xxxxx</td><td>1:180,000</td><td>Approach navigation</td><td>KR3F4G00.000</td></tr>
+                <tr><td><span class="badge badge-green">4</span></td><td>KR<strong>4</strong>xxxxx</td><td>1:90,000</td><td>Coastal detail</td><td>KR4F4G10.000</td></tr>
+                <tr><td><span class="badge badge-yellow">5</span></td><td>KR<strong>5</strong>xxxxx</td><td>1:22,000</td><td>Harbour approach</td><td>KR5F4G13.000</td></tr>
+                <tr><td><span class="badge badge-yellow">6</span></td><td>KR<strong>6</strong>xxxxx</td><td>1:12,000</td><td>Harbour detail</td><td>KR6xxxx.000</td></tr>
             </tbody>
         </table>
 
-        <h3 id="zoom-mapping">줌 레벨과 축척 매핑</h3>
-        <p>사용자가 지도를 확대/축소하면, 서버는 현재 줌 레벨에 맞는 축척의 해도를 자동으로 선택합니다.</p>
+        <h3 id="zoom-mapping">Zoom level and scale mapping</h3>
+        <p>When you zoom the map, the server automatically selects charts matching the current zoom level.</p>
         <table>
-            <thead><tr><th>줌 레벨</th><th>화면 축척 (대략)</th><th>로드하는 해도 등급</th></tr></thead>
+            <thead><tr><th>Zoom level</th><th>On-screen scale (approx.)</th><th>Chart bands loaded</th></tr></thead>
             <tbody>
-                <tr><td>4~5</td><td>1:25,000,000 ~ 1:50,000,000</td><td>등급 1, 2</td></tr>
-                <tr><td>6~7</td><td>1:5,000,000 ~ 1:10,000,000</td><td>등급 1, 2, 3</td></tr>
-                <tr><td>8~9</td><td>1:700,000 ~ 1:3,500,000</td><td>등급 2, 3, 4</td></tr>
-                <tr><td>10~11</td><td>1:180,000 ~ 1:350,000</td><td>등급 3, 4, 5</td></tr>
-                <tr><td>12~13</td><td>1:45,000 ~ 1:90,000</td><td>등급 4, 5, 6</td></tr>
-                <tr><td>14+</td><td>1:22,000 이하</td><td>등급 5, 6</td></tr>
+                <tr><td>4~5</td><td>1:25,000,000 ~ 1:50,000,000</td><td>Bands 1, 2</td></tr>
+                <tr><td>6~7</td><td>1:5,000,000 ~ 1:10,000,000</td><td>Bands 1, 2, 3</td></tr>
+                <tr><td>8~9</td><td>1:700,000 ~ 1:3,500,000</td><td>Bands 2, 3, 4</td></tr>
+                <tr><td>10~11</td><td>1:180,000 ~ 1:350,000</td><td>Bands 3, 4, 5</td></tr>
+                <tr><td>12~13</td><td>1:45,000 ~ 1:90,000</td><td>Bands 4, 5, 6</td></tr>
+                <tr><td>14+</td><td>1:22,000 or larger scale</td><td>Bands 5, 6</td></tr>
             </tbody>
         </table>
 
-        <h3 id="api">API 엔드포인트</h3>
+        <h3 id="api">API endpoints</h3>
         <table>
-            <thead><tr><th>API 경로</th><th>설명</th><th>사용 시점</th></tr></thead>
+            <thead><tr><th>API path</th><th>Description</th><th>When used</th></tr></thead>
             <tbody>
-                <tr><td><code>GET /api/index</code></td><td>전체 해도 목록과 각 해도의 범위 반환</td><td>페이지 로드 시</td></tr>
-                <tr><td><code>GET /api/charts</code></td><td>현재 화면 범위와 줌에 맞는 해도 데이터 반환</td><td>지도 이동/확대 시 자동 호출</td></tr>
-                <tr><td><code>GET /api/chart/{name}</code></td><td>특정 해도 하나의 전체 데이터 반환</td><td>개별 해도 조회 시</td></tr>
-                <tr><td><code>GET /api/categories</code></td><td>표시 카테고리 목록 반환</td><td>사이드바 구성 시</td></tr>
+                <tr><td><code>GET /api/index</code></td><td>Returns full chart list and extents</td><td>On page load</td></tr>
+                <tr><td><code>GET /api/charts</code></td><td>Returns chart data for current extent and zoom</td><td>Auto-called on pan/zoom</td></tr>
+                <tr><td><code>GET /api/chart/{name}</code></td><td>Returns full data for one chart</td><td>Single-chart query</td></tr>
+                <tr><td><code>GET /api/categories</code></td><td>Returns display category list</td><td>Sidebar setup</td></tr>
+                <tr><td><code>GET /api/datasource</code></td><td>Current data source status</td><td>Page load</td></tr>
+                <tr><td><code>POST /api/datasource</code></td><td>Set folder path and index charts</td><td>After folder selection</td></tr>
+                <tr><td><code>GET /api/datasource/report</code></td><td>Detailed folder analysis</td><td>After indexing</td></tr>
+                <tr><td><code>GET /api/visitors</code></td><td>Visitor statistics</td><td>About section</td></tr>
             </tbody>
         </table>
 
-        <h3 id="data-pipeline">데이터 변환 과정</h3>
-        <p>S-57 파일이 브라우저에서 표시되기까지의 과정입니다:</p>
+        <h3 id="data-pipeline">Data conversion pipeline</h3>
+        <p>Steps from S-57 file to map display:</p>
         <div class="diagram">
             <div class="diagram-flow">
-                <div class="diagram-box green"><h5>S-57 파일 (.000)</h5><p>ISO 8211 바이너리 형식</p></div>
-                <div class="diagram-arrow">&darr; pyogrio 라이브러리로 읽기</div>
-                <div class="diagram-box blue"><h5>WKB 지오메트리 + 속성 테이블</h5><p>바이너리 좌표 데이터와 부가 속성 정보</p></div>
-                <div class="diagram-arrow">&darr; WKB 파싱 (parse_wkb 함수)</div>
-                <div class="diagram-box blue"><h5>GeoJSON 변환</h5><p>{"type":"Feature", "geometry":{"type":"Point", "coordinates":[129.05, 35.10]}, ...}</p></div>
-                <div class="diagram-arrow">&darr; cache/ 폴더에 JSON 캐시 저장</div>
-                <div class="diagram-box accent"><h5>HTTP 응답 &rarr; OpenLayers 렌더링</h5><p>브라우저에서 지도 위에 시각화</p></div>
+                <div class="diagram-box green"><h5>S-57 file (.000)</h5><p>ISO 8211 binary format</p></div>
+                <div class="diagram-arrow">&darr; read with pyogrio</div>
+                <div class="diagram-box blue"><h5>WKB geometry + attribute table</h5><p>Binary coordinates and attributes</p></div>
+                <div class="diagram-arrow">&darr; WKB parsing (parse_wkb)</div>
+                <div class="diagram-box blue"><h5>GeoJSON conversion</h5><p>{"type":"Feature", "geometry":{"type":"Point", "coordinates":[129.05, 35.10]}, ...}</p></div>
+                <div class="diagram-arrow">&darr; save JSON cache under cache/</div>
+                <div class="diagram-box accent"><h5>HTTP response &rarr; OpenLayers rendering</h5><p>Visualized on the map in the browser</p></div>
             </div>
         </div>
 
-        <h3 id="caching">캐싱 시스템</h3>
+        <h3 id="caching">Caching</h3>
         <table>
-            <thead><tr><th>캐시 종류</th><th>파일</th><th>내용</th><th>생성 시점</th></tr></thead>
+            <thead><tr><th>Cache type</th><th>File</th><th>Contents</th><th>Created</th></tr></thead>
             <tbody>
-                <tr><td><strong>해도 인덱스</strong></td><td><code>cache/chart_index.json</code></td><td>744개 파일의 범위, 축척, 포함 레이어 정보</td><td>최초 실행 시 (1~2분)</td></tr>
-                <tr><td><strong>레이어 데이터</strong></td><td><code>cache/*.json</code></td><td>각 해도-레이어별 GeoJSON 변환 결과</td><td>해당 데이터 최초 요청 시</td></tr>
+                <tr><td><strong>Chart index</strong></td><td><code>cache/chart_index.json</code></td><td>Extent, scale, and layers for 744 files</td><td>First run (1&ndash;2 minutes)</td></tr>
+                <tr><td><strong>Layer data</strong></td><td><code>cache/*.json</code></td><td>GeoJSON per chart and layer</td><td>First request for that data</td></tr>
             </tbody>
         </table>
         <div class="alert alert-tip">
-            <strong>Tip:</strong> <code>cache/</code> 폴더를 삭제하면 모든 캐시가 초기화되며, 다음 실행 시 다시 생성됩니다.
+            <strong>Tip:</strong> Delete the <code>cache/</code> folder to reset all caches; they are rebuilt on the next run.
         </div>
 
         <!-- ====== 4. FRONTEND ====== -->
-        <h2 id="frontend">4. 프론트엔드 상세</h2>
+        <h2 id="frontend">4. Frontend</h2>
 
-        <h3 id="ui-layout">화면 구성</h3>
-        <p>화면은 크게 4개 영역으로 나뉩니다:</p>
+        <h3 id="ui-layout">UI layout</h3>
+        <p>The UI has four main areas:</p>
         <table>
-            <thead><tr><th>영역</th><th>위치</th><th>역할</th></tr></thead>
+            <thead><tr><th>Area</th><th>Location</th><th>Role</th></tr></thead>
             <tbody>
-                <tr><td><strong>상단바</strong></td><td>맨 위</td><td>로고, Dual Mode 토글, Disclaimer/Manual 버튼</td></tr>
-                <tr><td><strong>사이드바</strong></td><td>왼쪽</td><td>제품목록, 국가선택, 표시옵션, 차트정보, 범례</td></tr>
-                <tr><td><strong>지도 영역</strong></td><td>중앙</td><td>해도 데이터가 렌더링되는 인터랙티브 지도</td></tr>
-                <tr><td><strong>하단바</strong></td><td>맨 아래</td><td>축척 선택, 면책조항, 마우스 좌표 표시</td></tr>
+                <tr><td><strong>Top bar</strong></td><td>Top</td><td>Logo, Dual Mode toggle, Disclaimer/Manual</td></tr>
+                <tr><td><strong>Sidebar</strong></td><td>Left</td><td>Products, country, display options, chart info, legend, about</td></tr>
+                <tr><td><strong>Map</strong></td><td>Center</td><td>Interactive map rendering ENC data</td></tr>
+                <tr><td><strong>Bottom bar</strong></td><td>Bottom</td><td>Scale selector, disclaimer, mouse coordinates</td></tr>
             </tbody>
         </table>
 
-        <h3 id="display-options">표시 옵션 (Display Options)</h3>
-        <p>사이드바에서 각 해도 요소를 카테고리별로 켜고 끌 수 있습니다:</p>
+        <h3 id="display-options">Display options</h3>
+        <p>Toggle chart feature categories in the sidebar:</p>
         <table>
-            <thead><tr><th>옵션</th><th>색상</th><th>포함하는 해도 요소</th><th>설명</th></tr></thead>
+            <thead><tr><th>Option</th><th>Color</th><th>Layers included</th><th>Description</th></tr></thead>
             <tbody>
-                <tr><td><strong>Full Display</strong></td><td style="color:#FFB300">&#9679;</td><td>전체</td><td>모든 카테고리를 한번에 켜기/끄기</td></tr>
-                <tr><td><strong>Land</strong></td><td style="color:#8D6E63">&#9679;</td><td>육지, 랜드마크, 고도, 호수</td><td>땅으로 된 모든 지형</td></tr>
-                <tr><td><strong>Light</strong></td><td style="color:#FFEB3B">&#9679;</td><td>등대, 무신호(안개 신호)</td><td>빛을 내는 항해 보조시설</td></tr>
-                <tr><td><strong>Beacon</strong></td><td style="color:#F44336">&#9679;</td><td>방위/고립/측방 표지, 레이더</td><td>고정된 표지 구조물</td></tr>
-                <tr><td><strong>Buoy</strong></td><td style="color:#4CAF50">&#9679;</td><td>고립/측방/안전/특수 부표</td><td>바다에 떠 있는 표지</td></tr>
-                <tr><td><strong>Obstruction</strong></td><td style="color:#9C27B0">&#9679;</td><td>장애물, 수중 암초</td><td>항해에 위험한 물체</td></tr>
-                <tr><td><strong>Wreck</strong></td><td style="color:#E91E63">&#9679;</td><td>침몰 선박</td><td>바다 밑에 가라앉은 배</td></tr>
-                <tr><td><strong>Sounding</strong></td><td style="color:#00BCD4">&#9679;</td><td>수심 측량값</td><td>숫자로 표시되는 바다 깊이</td></tr>
-                <tr><td><strong>Depth Area</strong></td><td style="color:#3F51B5">&#9679;</td><td>수심 구역, 등심선</td><td>색으로 구분되는 수심 영역</td></tr>
-                <tr><td><strong>Coastline</strong></td><td style="color:#607D8B">&#9679;</td><td>해안선, 호안</td><td>바다와 육지의 경계선</td></tr>
-                <tr><td><strong>Navigation</strong></td><td style="color:#FF9800">&#9679;</td><td>항로, 정박지, 통제점</td><td>선박이 다니는 길 관련</td></tr>
-                <tr><td><strong>Infrastructure</strong></td><td style="color:#795548">&#9679;</td><td>교량, 케이블, 파이프라인, 댐</td><td>인공 구조물</td></tr>
+                <tr><td><strong>Full Display</strong></td><td style="color:#FFB300">&#9679;</td><td>All categories</td><td>Toggle all categories at once</td></tr>
+                <tr><td><strong>Land</strong></td><td style="color:#8D6E63">&#9679;</td><td>Land, landmarks, elevation, lakes</td><td>All land features</td></tr>
+                <tr><td><strong>Light</strong></td><td style="color:#FFEB3B">&#9679;</td><td>Lights, fog signals</td><td>Luminous aids to navigation</td></tr>
+                <tr><td><strong>Beacon</strong></td><td style="color:#F44336">&#9679;</td><td>Cardinal/isolated/lateral beacons, radar</td><td>Fixed aid structures</td></tr>
+                <tr><td><strong>Buoy</strong></td><td style="color:#4CAF50">&#9679;</td><td>Isolated/lateral/safe-water/special buoys</td><td>Floating aids</td></tr>
+                <tr><td><strong>Obstruction</strong></td><td style="color:#9C27B0">&#9679;</td><td>Obstructions, underwater rocks</td><td>Hazards to navigation</td></tr>
+                <tr><td><strong>Wreck</strong></td><td style="color:#E91E63">&#9679;</td><td>Wrecks</td><td>Submerged vessel remains</td></tr>
+                <tr><td><strong>Sounding</strong></td><td style="color:#00BCD4">&#9679;</td><td>Soundings</td><td>Depth values as numbers</td></tr>
+                <tr><td><strong>Depth Area</strong></td><td style="color:#3F51B5">&#9679;</td><td>Depth areas, contours</td><td>Depth areas by color</td></tr>
+                <tr><td><strong>Coastline</strong></td><td style="color:#607D8B">&#9679;</td><td>Coastline, shoreline structures</td><td>Sea&ndash;land boundary</td></tr>
+                <tr><td><strong>Navigation</strong></td><td style="color:#FF9800">&#9679;</td><td>Routes, anchorages, control points</td><td>Traffic-related features</td></tr>
+                <tr><td><strong>Infrastructure</strong></td><td style="color:#795548">&#9679;</td><td>Bridges, cables, pipelines, dams</td><td>Man-made structures</td></tr>
             </tbody>
         </table>
 
-        <h3 id="map-controls">지도 조작 방법</h3>
+        <h3 id="map-controls">Map controls</h3>
         <table>
-            <thead><tr><th>조작</th><th>방법</th></tr></thead>
+            <thead><tr><th>Action</th><th>How</th></tr></thead>
             <tbody>
-                <tr><td><strong>이동</strong></td><td>마우스 왼쪽 버튼을 누른 채 드래그</td></tr>
-                <tr><td><strong>확대</strong></td><td>마우스 휠 위로 또는 우측 상단 <kbd>+</kbd> 버튼</td></tr>
-                <tr><td><strong>축소</strong></td><td>마우스 휠 아래로 또는 우측 상단 <kbd>-</kbd> 버튼</td></tr>
-                <tr><td><strong>상세정보 보기</strong></td><td>해도 요소(등대, 부표 등)를 클릭</td></tr>
-                <tr><td><strong>좌표 확인</strong></td><td>마우스를 움직이면 우측 하단에 위도/경도 표시</td></tr>
+                <tr><td><strong>Pan</strong></td><td>Click and drag with the left mouse button</td></tr>
+                <tr><td><strong>Zoom in</strong></td><td>Mouse wheel up or <kbd>+</kbd> button</td></tr>
+                <tr><td><strong>Zoom out</strong></td><td>Mouse wheel down or <kbd>-</kbd> button</td></tr>
+                <tr><td><strong>Feature info</strong></td><td>Click a chart feature (light, buoy, etc.)</td></tr>
+                <tr><td><strong>Coordinates</strong></td><td>Move the mouse to see lat/lon at bottom right</td></tr>
             </tbody>
         </table>
 
         <div class="alert alert-info">
-            <strong>자동 로딩:</strong> 지도를 이동하거나 확대/축소하면 400ms 후 자동으로 새로운 데이터를 서버에 요청합니다. 로딩 중에는 "Loading charts..." 표시가 나타납니다.
+            <strong>Auto load:</strong> Panning or zooming triggers a new data request after 400 ms. "Loading charts..." is shown while loading.
         </div>
 
-        <h3 id="depth-colors">수심 색상 체계</h3>
-        <p>바다의 깊이에 따라 다른 색으로 표시됩니다:</p>
-        <div class="swatch-row"><span class="swatch" style="background:rgba(192,216,170,0.9)"></span> <strong>0m 이하 (간출지)</strong> &mdash; 썰물 때 드러나는 곳</div>
-        <div class="swatch-row"><span class="swatch" style="background:rgba(197,223,245,0.9)"></span> <strong>0 ~ 5m</strong> &mdash; 매우 얕음 (소형 선박 주의)</div>
-        <div class="swatch-row"><span class="swatch" style="background:rgba(175,210,240,0.9)"></span> <strong>5 ~ 10m</strong> &mdash; 얕음</div>
-        <div class="swatch-row"><span class="swatch" style="background:rgba(159,197,232,0.9)"></span> <strong>10 ~ 20m</strong> &mdash; 보통</div>
-        <div class="swatch-row"><span class="swatch" style="background:rgba(111,168,220,0.9)"></span> <strong>20 ~ 50m</strong> &mdash; 깊음</div>
-        <div class="swatch-row"><span class="swatch" style="background:rgba(84,141,196,0.9)"></span> <strong>50m 이상</strong> &mdash; 매우 깊음</div>
-
-        <h3 id="render-order">레이어 렌더링 순서</h3>
-        <p>지도 요소들은 아래에서 위로 순서대로 그려집니다 (아래 것이 먼저 그려져서 뒤에 위치):</p>
+        <h3 id="s52-preslib">IHO S-52 Presentation Library (PresLib e4.0.0)</h3>
+        <p>Map colours and symbols follow <code>public/PresLib_e4.0.0.dai</code>, parsed by <code>scripts/build_preslib.py</code> into <code>static/s52-preslib.json</code> and applied at runtime by <code>s52-preslib.js</code>.</p>
         <table>
-            <thead><tr><th>순서</th><th>레이어</th><th>설명</th></tr></thead>
+            <thead><tr><th>Item</th><th>Value</th></tr></thead>
             <tbody>
-                <tr><td>1 (바닥)</td><td>미조사해역 &rarr; 해역 &rarr; 수심구역 &rarr; 호수 &rarr; 육지</td><td>면(영역) 데이터</td></tr>
-                <tr><td>2</td><td>등심선 &rarr; 해안선 &rarr; 호안</td><td>선(경계) 데이터</td></tr>
-                <tr><td>3</td><td>정박지 &rarr; 항로 &rarr; 케이블 &rarr; 파이프라인</td><td>항해 구역/시설</td></tr>
-                <tr><td>4</td><td>교량 &rarr; 댐 &rarr; 부잔교 &rarr; 계선시설</td><td>인공 구조물</td></tr>
-                <tr><td>5</td><td>장애물 &rarr; 수중암초 &rarr; 침선</td><td>위험물</td></tr>
-                <tr><td>6</td><td>측심값 (숫자)</td><td>수심 숫자</td></tr>
-                <tr><td>7</td><td>부표 &rarr; 등표 &rarr; 두표 &rarr; 말뚝 &rarr; 랜드마크</td><td>항해 표지</td></tr>
-                <tr><td>8 (최상단)</td><td>레이더 &rarr; 무선국 &rarr; 등대</td><td>등화/통신 시설</td></tr>
+                <tr><td>Version / palette</td><td>4.0.0, <strong>DAY</strong></td></tr>
+                <tr><td>Colour tokens</td><td><strong>67</strong> (CCIE xyY &rarr; sRGB)</td></tr>
+                <tr><td>Object classes</td><td><strong>151</strong> S-57 objects</td></tr>
+                <tr><td>LUPT lookup rules</td><td><strong>1,164</strong> (geometry + attribute + INST)</td></tr>
+            </tbody>
+        </table>
+        <p>Each feature is matched to a LUPT rule; instructions (<code>AC</code>, <code>LS</code>, <code>SY</code>, <code>CS</code>) become OpenLayers styles. Conditional symbology includes <code>DEPARE03</code>, <code>DEPCNT03</code>, <code>SOUNDG03</code>, <code>LIGHTS06</code>, <code>OBSTRN07</code>, and <code>WRECKS05</code>.</p>
+        <div class="alert alert-tip">
+            <strong>Regenerate JSON:</strong> <code>python scripts/build_preslib.py</code>
+        </div>
+
+        <h3 id="depth-colors">Depth colour scheme (DEPARE03)</h3>
+        <p>Depth areas use S-52 tokens from <code>DRVAL1</code> and default contours (shallow 10&nbsp;m, safety 30&nbsp;m, deep 30&nbsp;m):</p>
+        <div class="swatch-row"><span class="swatch" style="background:#57ae9c"></span> <strong>DEPIT</strong> &mdash; drying (&lt;0&nbsp;m)</div>
+        <div class="swatch-row"><span class="swatch" style="background:#60b7fe"></span> <strong>DEPVS</strong> &mdash; 0&ndash;10&nbsp;m</div>
+        <div class="swatch-row"><span class="swatch" style="background:#82c9fe"></span> <strong>DEPMS</strong> &mdash; 10&ndash;30&nbsp;m</div>
+        <div class="swatch-row"><span class="swatch" style="background:#a6d9fb"></span> <strong>DEPMD</strong> &mdash; medium band</div>
+        <div class="swatch-row"><span class="swatch" style="background:#c9ecfe"></span> <strong>DEPDW</strong> &mdash; deep (&ge;30&nbsp;m) / sea background</div>
+
+        <h3 id="render-order">Layer draw order</h3>
+        <p>Features are drawn bottom to top (earlier layers appear behind later ones):</p>
+        <table>
+            <thead><tr><th>Order</th><th>Layers</th><th>Description</th></tr></thead>
+            <tbody>
+                <tr><td>1 (bottom)</td><td>Unsurveyed &rarr; sea area &rarr; depth areas &rarr; lakes &rarr; land</td><td>Polygon features</td></tr>
+                <tr><td>2</td><td>Contours &rarr; coastline &rarr; shoreline works</td><td>Line features</td></tr>
+                <tr><td>3</td><td>Anchorages &rarr; routes &rarr; cables &rarr; pipelines</td><td>Traffic areas and facilities</td></tr>
+                <tr><td>4</td><td>Bridges &rarr; dams &rarr; pontoons &rarr; moorings</td><td>Man-made structures</td></tr>
+                <tr><td>5</td><td>Obstructions &rarr; rocks &rarr; wrecks</td><td>Hazards</td></tr>
+                <tr><td>6</td><td>Soundings (numbers)</td><td>Depth labels</td></tr>
+                <tr><td>7</td><td>Buoys &rarr; beacons &rarr; top marks &rarr; piles &rarr; landmarks</td><td>Aids to navigation</td></tr>
+                <tr><td>8 (top)</td><td>Radar &rarr; radio stations &rarr; lights</td><td>Lights and radio aids</td></tr>
             </tbody>
         </table>
 
-        <h3 id="legend">범례 (기호 설명)</h3>
-        <div class="swatch-row"><span class="swatch" style="background:#d4c6a0"></span> 육지 (Land)</div>
-        <div class="swatch-row"><span class="swatch" style="background:#c5dff5"></span> 얕은 바다 (5m 미만)</div>
-        <div class="swatch-row"><span class="swatch" style="background:#9fc5e8"></span> 보통 깊이 (5~20m)</div>
-        <div class="swatch-row"><span class="swatch" style="background:#6fa8dc"></span> 깊은 바다 (20m 이상)</div>
-        <div class="swatch-row"><span class="swatch swatch-circle" style="background:#FFEB3B; border: 2px solid #F57F17"></span> 등대 (Light)</div>
-        <div class="swatch-row"><span class="swatch swatch-circle" style="background:#F44336"></span> 등표 (Beacon) &mdash; 빨간/초록 다이아몬드</div>
-        <div class="swatch-row"><span class="swatch-sym" style="color:#4CAF50; font-size:18px">&#9650;</span> 부표 (Buoy) &mdash; 삼각형 (빨강/초록/노랑)</div>
-        <div class="swatch-row"><span class="swatch-sym" style="color:#E91E63; font-size:16px">&#10005;</span> 침몰 선박 (Wreck)</div>
-        <div class="swatch-row"><span class="swatch-sym" style="color:#9C27B0; font-size:16px">&#9733;</span> 장애물/암초 (Obstruction)</div>
+        <h3 id="legend">Legend (S-52 DAY tokens)</h3>
+        <div class="swatch-row"><span class="swatch" style="background:#bebe8f"></span> Land (LANDA)</div>
+        <div class="swatch-row"><span class="swatch" style="background:#60b7fe"></span> Very shallow (DEPVS)</div>
+        <div class="swatch-row"><span class="swatch" style="background:#82c9fe"></span> Shallow (DEPMS)</div>
+        <div class="swatch-row"><span class="swatch" style="background:#a6d9fb"></span> Medium depth (DEPMD)</div>
+        <div class="swatch-row"><span class="swatch swatch-circle" style="background:#e0e038; border: 2px solid #000"></span> Light (CHYLW / LITRD / LITGN)</div>
+        <div class="swatch-row"><span class="swatch swatch-circle" style="background:#e95470"></span> Beacon (CHRED / CHGRN)</div>
+        <div class="swatch-row"><span class="swatch-sym" style="color:#52e83a; font-size:18px">&#9650;</span> Buoy (triangle)</div>
+        <div class="swatch-row"><span class="swatch-sym" style="color:#000; font-size:16px">&#10005;</span> Wreck (CHBLK)</div>
+        <div class="swatch-row"><span class="swatch-sym" style="color:#768c97; font-size:16px">&#9733;</span> Obstruction (CHGRD)</div>
 
         <!-- ====== 5. LAYERS ====== -->
-        <h2 id="layers">5. S-57 데이터 레이어 용어 사전</h2>
+        <h2 id="layers">5. S-57 layer reference</h2>
 
-        <h3 id="layer-terrain">지형 레이어</h3>
+        <h3 id="layer-terrain">Terrain layers</h3>
         <table>
-            <thead><tr><th>코드</th><th>영문명</th><th>한글명</th><th>설명</th></tr></thead>
+            <thead><tr><th>Code</th><th>Name</th><th>Description</th></tr></thead>
             <tbody>
-                <tr><td><code>LNDARE</code></td><td>Land Area</td><td>육지 영역</td><td>땅으로 된 영역 (섬 포함)</td></tr>
-                <tr><td><code>LAKARE</code></td><td>Lake Area</td><td>호수</td><td>내륙의 담수 호수</td></tr>
-                <tr><td><code>SEAARE</code></td><td>Sea Area</td><td>해역</td><td>바다 영역에 이름을 붙인 구역</td></tr>
-                <tr><td><code>COALNE</code></td><td>Coastline</td><td>해안선</td><td>육지와 바다의 경계선</td></tr>
-                <tr><td><code>SLCONS</code></td><td>Shoreline Construction</td><td>호안/해안 구조물</td><td>방파제, 제방 등 인공 해안 구조물</td></tr>
-                <tr><td><code>LNDMRK</code></td><td>Landmark</td><td>랜드마크</td><td>항해 시 위치 파악에 도움이 되는 육상 표지</td></tr>
-                <tr><td><code>LNDELV</code></td><td>Land Elevation</td><td>육상 고도</td><td>육지의 높이 정보</td></tr>
-                <tr><td><code>LNDRGN</code></td><td>Land Region</td><td>육상 지역명</td><td>육지 지역의 이름</td></tr>
+                <tr><td><code>LNDARE</code></td><td>Land Area</td><td>Land polygon (including islands)</td></tr>
+                <tr><td><code>LAKARE</code></td><td>Lake Area</td><td>Inland lake</td></tr>
+                <tr><td><code>SEAARE</code></td><td>Sea Area</td><td>Named sea area</td></tr>
+                <tr><td><code>COALNE</code></td><td>Coastline</td><td>Coastline</td></tr>
+                <tr><td><code>SLCONS</code></td><td>Shoreline Construction</td><td>Shoreline construction (breakwaters, etc.)</td></tr>
+                <tr><td><code>LNDMRK</code></td><td>Landmark</td><td>Landmark for position fixing</td></tr>
+                <tr><td><code>LNDELV</code></td><td>Land Elevation</td><td>Land elevation</td></tr>
+                <tr><td><code>LNDRGN</code></td><td>Land Region</td><td>Named land region</td></tr>
             </tbody>
         </table>
 
-        <h3 id="layer-depth">수심 레이어</h3>
+        <h3 id="layer-depth">Depth layers</h3>
         <table>
-            <thead><tr><th>코드</th><th>영문명</th><th>한글명</th><th>설명</th></tr></thead>
+            <thead><tr><th>Code</th><th>Name</th><th>Description</th></tr></thead>
             <tbody>
-                <tr><td><code>DEPARE</code></td><td>Depth Area</td><td>수심 구역</td><td>일정 수심 범위를 가진 바다 영역 (DRVAL1~DRVAL2)</td></tr>
-                <tr><td><code>DEPCNT</code></td><td>Depth Contour</td><td>등심선</td><td>같은 수심을 이은 선</td></tr>
-                <tr><td><code>SOUNDG</code></td><td>Sounding</td><td>측심값</td><td>특정 지점의 정확한 수심 (숫자로 표시)</td></tr>
-                <tr><td><code>SBDARE</code></td><td>Seabed Area</td><td>해저면</td><td>해저 바닥의 종류 (모래, 진흙, 암반 등)</td></tr>
+                <tr><td><code>DEPARE</code></td><td>Depth Area</td><td>Depth area (DRVAL1&ndash;DRVAL2)</td></tr>
+                <tr><td><code>DEPCNT</code></td><td>Depth Contour</td><td>Depth contour</td></tr>
+                <tr><td><code>SOUNDG</code></td><td>Sounding</td><td>Sounding (numeric depth)</td></tr>
+                <tr><td><code>SBDARE</code></td><td>Seabed Area</td><td>Seabed surface type</td></tr>
             </tbody>
         </table>
 
-        <h3 id="layer-navaid">항해 표지 레이어</h3>
+        <h3 id="layer-navaid">Navigation aid layers</h3>
         <table>
-            <thead><tr><th>코드</th><th>영문명</th><th>한글명</th><th>설명</th></tr></thead>
+            <thead><tr><th>Code</th><th>Name</th><th>Description</th></tr></thead>
             <tbody>
-                <tr><td><code>LIGHTS</code></td><td>Light</td><td>등대/등화</td><td>밤에 빛을 내어 선박을 안내하는 시설</td></tr>
-                <tr><td><code>FOGSIG</code></td><td>Fog Signal</td><td>무신호</td><td>안개 속에서 소리로 위치를 알리는 장치</td></tr>
-                <tr><td><code>BOYLAT</code></td><td>Buoy, Lateral</td><td>측방부표</td><td>항로의 좌/우 경계를 표시 (빨강=우현, 초록=좌현)</td></tr>
-                <tr><td><code>BOYISD</code></td><td>Buoy, Isolated Danger</td><td>고립위험부표</td><td>그 위치에 위험물이 있음을 표시</td></tr>
-                <tr><td><code>BOYSAW</code></td><td>Buoy, Safe Water</td><td>안전수역부표</td><td>주변 수역이 안전함을 표시</td></tr>
-                <tr><td><code>BOYSPP</code></td><td>Buoy, Special Purpose</td><td>특수부표</td><td>특수 목적(군사구역, 양식장 등)</td></tr>
-                <tr><td><code>BCNCAR</code></td><td>Beacon, Cardinal</td><td>방위표지</td><td>위험물의 방향을 알려주는 고정 표지</td></tr>
-                <tr><td><code>BCNISD</code></td><td>Beacon, Isolated Danger</td><td>고립장애표지</td><td>고립된 위험물 위에 세운 고정 표지</td></tr>
-                <tr><td><code>BCNLAT</code></td><td>Beacon, Lateral</td><td>측방표지</td><td>항로 경계를 표시하는 고정 표지</td></tr>
-                <tr><td><code>TOPMAR</code></td><td>Top Mark</td><td>두표</td><td>부표나 등표 꼭대기에 있는 식별용 형상물</td></tr>
-                <tr><td><code>RTPBCN</code></td><td>Radar Transponder</td><td>레이더 응답기</td><td>선박 레이더에 응답하는 장치</td></tr>
+                <tr><td><code>LIGHTS</code></td><td>Light</td><td>Light</td></tr>
+                <tr><td><code>FOGSIG</code></td><td>Fog Signal</td><td>Fog signal</td></tr>
+                <tr><td><code>BOYLAT</code></td><td>Buoy, Lateral</td><td>Lateral buoy</td></tr>
+                <tr><td><code>BOYISD</code></td><td>Buoy, Isolated Danger</td><td>Isolated danger buoy</td></tr>
+                <tr><td><code>BOYSAW</code></td><td>Buoy, Safe Water</td><td>Safe-water buoy</td></tr>
+                <tr><td><code>BOYSPP</code></td><td>Buoy, Special Purpose</td><td>Special-purpose buoy</td></tr>
+                <tr><td><code>BCNCAR</code></td><td>Beacon, Cardinal</td><td>Cardinal beacon</td></tr>
+                <tr><td><code>BCNISD</code></td><td>Beacon, Isolated Danger</td><td>Isolated danger beacon</td></tr>
+                <tr><td><code>BCNLAT</code></td><td>Beacon, Lateral</td><td>Lateral beacon</td></tr>
+                <tr><td><code>TOPMAR</code></td><td>Top Mark</td><td>Top mark</td></tr>
+                <tr><td><code>RTPBCN</code></td><td>Radar Transponder</td><td>Radar transponder beacon</td></tr>
             </tbody>
         </table>
 
-        <h3 id="layer-hazard">위험물 레이어</h3>
+        <h3 id="layer-hazard">Hazard layers</h3>
         <table>
-            <thead><tr><th>코드</th><th>영문명</th><th>한글명</th><th>설명</th></tr></thead>
+            <thead><tr><th>Code</th><th>Name</th><th>Description</th></tr></thead>
             <tbody>
-                <tr><td><code>OBSTRN</code></td><td>Obstruction</td><td>장애물</td><td>항해에 방해가 되는 수중/수면 물체</td></tr>
-                <tr><td><code>UWTROC</code></td><td>Underwater Rock</td><td>수중 암초</td><td>물 밑에 잠긴 바위</td></tr>
-                <tr><td><code>WRECKS</code></td><td>Wreck</td><td>침몰선</td><td>바다 밑에 가라앉은 선박 잔해</td></tr>
+                <tr><td><code>OBSTRN</code></td><td>Obstruction</td><td>Obstruction</td></tr>
+                <tr><td><code>UWTROC</code></td><td>Underwater Rock</td><td>Underwater rock</td></tr>
+                <tr><td><code>WRECKS</code></td><td>Wreck</td><td>Wreck</td></tr>
             </tbody>
         </table>
 
-        <h3 id="layer-traffic">항해/교통 레이어</h3>
+        <h3 id="layer-traffic">Traffic layers</h3>
         <table>
-            <thead><tr><th>코드</th><th>영문명</th><th>한글명</th><th>설명</th></tr></thead>
+            <thead><tr><th>Code</th><th>Name</th><th>Description</th></tr></thead>
             <tbody>
-                <tr><td><code>DWRTPT</code></td><td>Deep Water Route</td><td>심수 항로</td><td>대형 선박이 다니는 깊은 물길</td></tr>
-                <tr><td><code>TWRTPT</code></td><td>Two-Way Route</td><td>양방향 항로</td><td>양방향 통행이 가능한 항로</td></tr>
-                <tr><td><code>FERYRT</code></td><td>Ferry Route</td><td>여객선 항로</td><td>정기 여객선이 다니는 길</td></tr>
-                <tr><td><code>ACHBRT</code></td><td>Anchorage</td><td>정박지</td><td>선박이 닻을 내리고 정박하는 구역</td></tr>
-                <tr><td><code>RDOCAL</code></td><td>Radio Calling-In Point</td><td>무선 호출 지점</td><td>선박이 무선으로 보고해야 하는 지점</td></tr>
-                <tr><td><code>RDOSTA</code></td><td>Radio Station</td><td>무선국</td><td>해양 무선 통신 기지국</td></tr>
+                <tr><td><code>DWRTPT</code></td><td>Deep Water Route</td><td>Deep-water route</td></tr>
+                <tr><td><code>TWRTPT</code></td><td>Two-Way Route</td><td>Two-way route</td></tr>
+                <tr><td><code>FERYRT</code></td><td>Ferry Route</td><td>Ferry route</td></tr>
+                <tr><td><code>ACHBRT</code></td><td>Anchorage</td><td>Anchorage</td></tr>
+                <tr><td><code>RDOCAL</code></td><td>Radio Calling-In Point</td><td>Radio calling-in point</td></tr>
+                <tr><td><code>RDOSTA</code></td><td>Radio Station</td><td>Radio station</td></tr>
             </tbody>
         </table>
 
-        <h3 id="layer-infra">시설물 레이어</h3>
+        <h3 id="layer-infra">Infrastructure layers</h3>
         <table>
-            <thead><tr><th>코드</th><th>영문명</th><th>한글명</th><th>설명</th></tr></thead>
+            <thead><tr><th>Code</th><th>Name</th><th>Description</th></tr></thead>
             <tbody>
-                <tr><td><code>BRIDGE</code></td><td>Bridge</td><td>교량</td><td>바다/강 위를 지나는 다리</td></tr>
-                <tr><td><code>CBLOHD</code></td><td>Cable, Overhead</td><td>가공 케이블</td><td>공중에 걸린 전선 (선박 마스트 주의)</td></tr>
-                <tr><td><code>CBLSUB</code></td><td>Cable, Submarine</td><td>해저 케이블</td><td>바다 밑 통신/전력 케이블 (투묘 금지)</td></tr>
-                <tr><td><code>PIPSOL</code></td><td>Pipeline</td><td>파이프라인</td><td>해저 또는 육상 파이프라인</td></tr>
-                <tr><td><code>MORFAC</code></td><td>Mooring Facility</td><td>계선시설</td><td>선박을 묶어두는 시설</td></tr>
-                <tr><td><code>DAMCON</code></td><td>Dam</td><td>댐</td><td>댐, 방조제</td></tr>
-                <tr><td><code>PONTON</code></td><td>Pontoon</td><td>부잔교</td><td>물에 뜨는 부두/다리</td></tr>
+                <tr><td><code>BRIDGE</code></td><td>Bridge</td><td>Bridge</td></tr>
+                <tr><td><code>CBLOHD</code></td><td>Cable, Overhead</td><td>Overhead cable</td></tr>
+                <tr><td><code>CBLSUB</code></td><td>Cable, Submarine</td><td>Submarine cable</td></tr>
+                <tr><td><code>PIPSOL</code></td><td>Pipeline</td><td>Pipeline</td></tr>
+                <tr><td><code>MORFAC</code></td><td>Mooring Facility</td><td>Mooring facility</td></tr>
+                <tr><td><code>DAMCON</code></td><td>Dam</td><td>Dam</td></tr>
+                <tr><td><code>PONTON</code></td><td>Pontoon</td><td>Pontoon</td></tr>
             </tbody>
         </table>
 
         <!-- ====== 6. HOW TO RUN ====== -->
-        <h2 id="howto">6. 실행 방법</h2>
+        <h2 id="howto">6. How to run</h2>
 
-        <h3>사전 요구사항</h3>
+        <h3>Requirements</h3>
         <table>
-            <thead><tr><th>소프트웨어</th><th>최소 버전</th><th>설치 확인 명령</th></tr></thead>
+            <thead><tr><th>Software</th><th>Minimum version</th><th>Check install</th></tr></thead>
             <tbody>
-                <tr><td>Python</td><td>3.10 이상</td><td><code>python --version</code></td></tr>
-                <tr><td>pip</td><td>최신</td><td><code>pip --version</code></td></tr>
+                <tr><td>Python</td><td>3.10+</td><td><code>python --version</code></td></tr>
+                <tr><td>pip</td><td>Latest</td><td><code>pip --version</code></td></tr>
             </tbody>
         </table>
 
-        <h3>설치 및 실행</h3>
+        <h3>Install and run</h3>
         <div class="steps">
             <div class="step">
                 <div class="step-content">
-                    <h4>의존성 설치</h4>
+                    <h4>Install dependencies</h4>
                     <p><code>pip install fastapi uvicorn pyogrio</code></p>
                 </div>
             </div>
             <div class="step">
                 <div class="step-content">
-                    <h4>서버 실행</h4>
-                    <p><code>cd "D:\src\s-57 viewer"</code> 후 <code>python server.py</code></p>
+                    <h4>Start server</h4>
+                    <p><code>cd "D:\src\s-57 viewer"</code> then <code>python server.py</code></p>
                 </div>
             </div>
             <div class="step">
                 <div class="step-content">
-                    <h4>브라우저 접속</h4>
-                    <p><code>http://localhost:8080</code> 으로 접속</p>
+                    <h4>Open in browser</h4>
+                    <p>Open <code>http://localhost:8080</code></p>
                 </div>
             </div>
         </div>
 
         <div class="alert alert-info">
-            <strong>참고:</strong> 최초 실행 시 744개 파일 인덱싱에 약 1~2분 소요됩니다. 두 번째 실행부터는 캐시를 사용하므로 즉시 시작됩니다.
+            <strong>Note:</strong> First run indexes 744 files (about 1&ndash;2 minutes). Later runs use the cache and start immediately.
         </div>
 
         <!-- ====== 7. PERFORMANCE ====== -->
-        <h2 id="performance">7. 성능 관련 참고사항</h2>
+        <h2 id="performance">7. Performance notes</h2>
         <table>
-            <thead><tr><th>항목</th><th>상세</th></tr></thead>
+            <thead><tr><th>Topic</th><th>Details</th></tr></thead>
             <tbody>
-                <tr><td><strong>최초 인덱싱</strong></td><td>744개 파일 스캔에 1~2분 소요 &rarr; 이후 캐시에서 즉시 로드</td></tr>
-                <tr><td><strong>레이어 변환</strong></td><td>각 레이어 최초 요청 시 수초 소요 &rarr; 이후 캐시에서 즉시 응답</td></tr>
-                <tr><td><strong>동시 로드 제한</strong></td><td>한 번에 최대 30개 해도까지 로드 (성능 보호)</td></tr>
-                <tr><td><strong>브라우저 메모리</strong></td><td>수만 개 피처 로드 시 느려질 수 있음 &rarr; 불필요한 레이어 끄기 권장</td></tr>
-                <tr><td><strong>캐시 초기화</strong></td><td><code>cache/</code> 폴더 삭제 후 재시작</td></tr>
+                <tr><td><strong>Initial indexing</strong></td><td>Scanning 744 files takes 1&ndash;2 min, then cached</td></tr>
+                <tr><td><strong>Layer conversion</strong></td><td>First request per layer may take seconds, then cached</td></tr>
+                <tr><td><strong>Load limit</strong></td><td>Up to 30 charts per request (performance cap)</td></tr>
+                <tr><td><strong>Browser memory</strong></td><td>Many features may slow the UI; disable unused layers</td></tr>
+                <tr><td><strong>Reset cache</strong></td><td>Delete <code>cache/</code> and restart</td></tr>
             </tbody>
         </table>
 
         <!-- ====== 8. TROUBLESHOOTING ====== -->
-        <h2 id="troubleshooting">8. 문제 해결</h2>
+        <h2 id="troubleshooting">8. Troubleshooting</h2>
         <table>
-            <thead><tr><th>증상</th><th>원인</th><th>해결 방법</th></tr></thead>
+            <thead><tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr></thead>
             <tbody>
-                <tr><td>서버 시작 시 "ModuleNotFoundError"</td><td>의존성 미설치</td><td><code>pip install fastapi uvicorn pyogrio</code></td></tr>
-                <tr><td>지도가 빈 화면으로 표시</td><td>데이터 로딩 중</td><td>"Loading charts..." 표시가 사라질 때까지 대기</td></tr>
-                <tr><td>특정 해역에 데이터가 없음</td><td>해당 축척의 해도 부재</td><td>줌을 축소하여 더 넓은 범위의 해도 로드</td></tr>
-                <tr><td>브라우저가 느려짐</td><td>피처가 너무 많음</td><td>사이드바에서 불필요한 레이어 끄기</td></tr>
-                <tr><td>"Port 8080 already in use"</td><td>이전 서버가 실행 중</td><td>이전 서버 프로세스 종료 후 재시작</td></tr>
-                <tr><td>캐시 오류</td><td>캐시 파일 손상</td><td><code>cache/</code> 폴더 삭제 후 재시작</td></tr>
+                <tr><td>"ModuleNotFoundError" on startup</td><td>Missing dependencies</td><td><code>pip install fastapi uvicorn pyogrio</code></td></tr>
+                <tr><td>Blank map</td><td>Data still loading</td><td>Wait until "Loading charts..." clears</td></tr>
+                <tr><td>No data in an area</td><td>No chart at that scale</td><td>Zoom out to load broader-scale charts</td></tr>
+                <tr><td>Slow browser</td><td>Too many features</td><td>Turn off unused layers in the sidebar</td></tr>
+                <tr><td>"Port 8080 already in use"</td><td>Previous server still running</td><td>Stop the old process and restart</td></tr>
+                <tr><td>Cache error</td><td>Corrupted cache files</td><td>Delete <code>cache/</code> and restart</td></tr>
             </tbody>
         </table>
 
         <br><br>
         <div class="alert alert-info" style="text-align:center">
-            <strong>S-57 Web Viewer</strong> &mdash; 대한민국 전자해도 744개 파일을 웹 브라우저에서 시각화하는 오픈 프로젝트
+            <strong>S-57 Web Viewer</strong> v0.0.1 &mdash; Author: Kim Kilyong, Korea Maritime University &mdash; Contact: <a href="mailto:ejavm83@gmail.com">ejavm83@gmail.com</a> &mdash; Release: 17 May 2026<br>
+            <a href="https://github.com/ejavm83/s57viewer">github.com/ejavm83/s57viewer</a>
         </div>
     </main>
 </div>

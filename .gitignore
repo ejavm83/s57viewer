@@ -1,5 +1,6 @@
 # Runtime cache (GeoJSON tiles)
 cache/
+cache/uploads/
 
 # Local / IDE
 .claude/
@@ -15,3 +16,5 @@ venv/
 # OS
 Thumbs.db
 .DS_Store
+
+.vercel

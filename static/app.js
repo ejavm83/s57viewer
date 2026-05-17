@@ -21,6 +21,8 @@
     let loadingAbort = null;
     let loadDebounce = null;
     let preslibReady = false;
+    let datasourceReady = false;
+    let datasourceLoadActive = false;
 
     function isLayerVisible(layerName) {
         for (const [cat, layers] of Object.entries(CATEGORIES)) {
@@ -38,7 +40,8 @@
         if (layer === 'SOUNDG' && resolution > 200) return null;
         if (layer === 'M_COVR') return null;
         if (layer === 'M_QUAL') return null;
-        if ((layer === 'LNDMRK' || layer === 'TOPMAR' || layer === 'PILPNT') && resolution > 1000) return null;
+        if ((layer === 'LNDRGN' || layer === 'LNDELV')) return null;
+        if ((layer === 'LNDMRK' || layer === 'TOPMAR' || layer === 'PILPNT') && resolution > 800) return null;
         if (layer === 'DEPCNT' && resolution > 600) return null;
         if ((layer === 'OBSTRN' || layer === 'UWTROC' || layer === 'WRECKS')
             && feature.getGeometry().getType() === 'Point' && resolution > 800) return null;
@@ -125,6 +128,8 @@
     }
 
     async function loadCharts() {
+        if (!datasourceReady) return;
+
         if (loadingAbort) loadingAbort.abort();
         loadingAbort = new AbortController();
         const signal = loadingAbort.signal;
@@ -138,15 +143,27 @@
         if (visibleLayers.length === 0) {
             vectorSource.clear();
             updateInfo(0, 0);
+            renderViewportReport(null);
+            showLoading(false);
             return;
         }
 
         showLoading(true);
+        updateProgressUI({
+            message: 'Loading chart features for map…',
+            percent: null,
+            detail: `Zoom ${zoom}`,
+            indeterminate: true,
+        });
 
         try {
             const url = `/api/charts?west=${west}&south=${south}&east=${east}&north=${north}&zoom=${zoom}&layers=${visibleLayers.join(',')}`;
             const resp = await fetch(url, { signal });
             if (signal.aborted) return;
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({}));
+                throw new Error(err.detail || resp.statusText);
+            }
             const data = await resp.json();
 
             vectorSource.clear();
@@ -160,6 +177,7 @@
             vectorSource.addFeatures(features);
             currentFeatures = data;
             updateInfo(data.meta.charts_loaded, data.meta.total_features);
+            renderViewportReport(data.meta);
         } catch (e) {
             if (e.name !== 'AbortError') {
                 console.error('Failed to load charts:', e);
@@ -170,8 +188,398 @@
     }
 
     function debouncedLoad() {
+        if (!datasourceReady) return;
         if (loadDebounce) clearTimeout(loadDebounce);
         loadDebounce = setTimeout(loadCharts, 400);
+    }
+
+    function escapeHtml(text) {
+        return String(text)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+
+    function formatBounds(bounds) {
+        if (!bounds || bounds.length !== 4) return '—';
+        return `W ${bounds[0].toFixed(2)}° S ${bounds[1].toFixed(2)}° E ${bounds[2].toFixed(2)}° N ${bounds[3].toFixed(2)}°`;
+    }
+
+    function renderFolderLoadReport(report) {
+        const panel = document.getElementById('load-report-panel');
+        const summaryEl = document.getElementById('load-report-summary');
+        const detailEl = document.getElementById('load-report-detail-body');
+        if (!panel || !summaryEl || !detailEl || !report) return;
+
+        const s = report.summary || {};
+        const bands = s.scale_bands || {};
+        const bandRows = Object.keys(bands).sort((a, b) => Number(a) - Number(b))
+            .map(b => `<tr><td>${escapeHtml(bands[b].label)}</td><td>${bands[b].count}</td></tr>`)
+            .join('');
+
+        const topLayers = (s.top_layers || [])
+            .map(l => `<tr><td>${escapeHtml(l.layer)}</td><td>${l.charts}</td></tr>`)
+            .join('');
+
+        const cacheNote = s.from_cache
+            ? 'Index loaded from cache (faster).'
+            : (s.duration_sec != null ? `Indexed in ${s.duration_sec}s.` : '');
+
+        summaryEl.innerHTML = `
+            <div class="report-stat-grid">
+                <div class="report-stat"><strong>${s.files_found ?? 0}</strong><span>.000 files found</span></div>
+                <div class="report-stat"><strong>${s.indexed_ok ?? 0}</strong><span>indexed OK</span></div>
+                <div class="report-stat"><strong>${s.indexed_failed ?? 0}</strong><span>failed</span></div>
+                <div class="report-stat"><strong>${(s.layers_per_chart?.avg ?? 0)}</strong><span>avg layers/chart</span></div>
+            </div>
+            <table class="report-scale-table">
+                <thead><tr><th>Scale band</th><th>Charts</th></tr></thead>
+                <tbody>${bandRows || '<tr><td colspan="2">—</td></tr>'}</tbody>
+            </table>
+            ${topLayers ? `<table class="report-scale-table"><thead><tr><th>Top layers</th><th>Charts</th></tr></thead><tbody>${topLayers}</tbody></table>` : ''}
+            <p class="report-note">${escapeHtml(formatBounds(s.bounds))}${cacheNote ? '<br>' + escapeHtml(cacheNote) : ''}</p>
+        `;
+
+        const indexed = report.indexed || [];
+        const failed = report.failed || [];
+        let detailHtml = '';
+
+        if (indexed.length) {
+            detailHtml += `<p><strong>Indexed charts (${indexed.length})</strong></p>
+                <table><thead><tr><th>File</th><th>Scale</th><th>Layers</th><th>Bounds</th></tr></thead><tbody>`;
+            detailHtml += indexed.map(c => {
+                const b = c.bounds;
+                const bStr = b ? `${b[0].toFixed(1)},${b[1].toFixed(1)}–${b[2].toFixed(1)},${b[3].toFixed(1)}` : '—';
+                return `<tr>
+                    <td>${escapeHtml(c.file)}</td>
+                    <td>${escapeHtml(c.scale_label || c.scale)}</td>
+                    <td>${c.layer_count}</td>
+                    <td>${bStr}</td>
+                </tr>`;
+            }).join('');
+            detailHtml += '</tbody></table>';
+        }
+
+        if (failed.length) {
+            detailHtml += `<p class="report-failed"><strong>Failed (${failed.length})</strong></p>
+                <table><thead><tr><th>File</th><th>Error</th></tr></thead><tbody>`;
+            detailHtml += failed.map(c => `<tr class="status-fail">
+                <td>${escapeHtml(c.file)}</td>
+                <td>${escapeHtml(c.error)}</td>
+            </tr>`).join('');
+            detailHtml += '</tbody></table>';
+        }
+
+        if (!detailHtml) {
+            detailHtml = '<p class="report-note">No per-file details.</p>';
+        }
+
+        detailEl.innerHTML = detailHtml;
+        panel.classList.remove('hidden');
+    }
+
+    function hideFolderLoadReport() {
+        document.getElementById('load-report-panel')?.classList.add('hidden');
+    }
+
+    async function fetchAndRenderFolderReport(existingReport) {
+        if (existingReport && existingReport.indexed) {
+            renderFolderLoadReport(existingReport);
+            return;
+        }
+        try {
+            const resp = await fetch('/api/datasource/report');
+            if (resp.ok) {
+                renderFolderLoadReport(await resp.json());
+            } else if (existingReport?.summary) {
+                renderFolderLoadReport({ summary: existingReport.summary, indexed: [], failed: [] });
+            }
+        } catch (e) {
+            console.warn('Could not load folder report:', e);
+        }
+    }
+
+    function renderViewportReport(meta) {
+        const details = document.getElementById('viewport-report-details');
+        const body = document.getElementById('viewport-report-body');
+        const matchedEl = document.getElementById('info-charts-matched');
+        if (!details || !body || !meta) return;
+
+        if (matchedEl) {
+            const matched = meta.charts_matched ?? meta.charts_loaded ?? 0;
+            matchedEl.textContent = meta.charts_capped
+                ? `${matched} (${meta.charts_loaded} drawn, max ${meta.max_charts})`
+                : String(matched);
+        }
+
+        if (!meta.charts_matched && !meta.charts_loaded) {
+            details.classList.remove('hidden');
+            body.innerHTML = `<p class="report-note">No charts match this view at zoom ${meta.zoom}. ` +
+                `Try zooming out for overview charts (Ocean/Coastal) or zooming in for Harbour charts.</p>`;
+            return;
+        }
+
+        if (!meta.charts_loaded) {
+            details.classList.remove('hidden');
+            body.innerHTML = `<p class="report-note">${meta.charts_matched} chart(s) match this area but none were drawn ` +
+                `(limit: ${meta.max_charts} per request). Pan or zoom slightly and wait for reload.</p>`;
+            return;
+        }
+
+        const scaleLabels = (meta.target_scale_labels || []).join(', ');
+        let html = `<p class="report-note">Zoom ${meta.zoom} · scales: ${escapeHtml(scaleLabels || '—')}</p>`;
+
+        if (meta.charts && meta.charts.length) {
+            html += `<table><thead><tr><th>Chart</th><th>Scale</th><th>Features</th></tr></thead><tbody>`;
+            html += meta.charts.map(c => `<tr>
+                <td>${escapeHtml(c.file)}</td>
+                <td>${escapeHtml(c.scale_label || c.scale)}</td>
+                <td>${(c.features || 0).toLocaleString()}</td>
+            </tr>`).join('');
+            html += '</tbody></table>';
+        }
+
+        if (meta.features_by_layer && meta.features_by_layer.length) {
+            html += `<p style="margin-top:8px"><strong>Features by layer</strong></p>
+                <table><thead><tr><th>Layer</th><th>Count</th></tr></thead><tbody>`;
+            html += meta.features_by_layer.map(l => `<tr>
+                <td>${escapeHtml(l.layer)}</td>
+                <td>${l.features.toLocaleString()}</td>
+            </tr>`).join('');
+            html += '</tbody></table>';
+        }
+
+        body.innerHTML = html;
+        details.classList.remove('hidden');
+    }
+
+    function updateDatasourceUI(data) {
+        const pathEl = document.getElementById('datasource-path');
+        const countEl = document.getElementById('datasource-count');
+        if (!pathEl) return;
+
+        if (data && data.loaded) {
+            pathEl.textContent = data.path || '—';
+            pathEl.title = (data.paths || []).join('\n') || data.path || '';
+            const s = data.report?.summary;
+            const failed = s?.indexed_failed ?? 0;
+            countEl.textContent = failed > 0
+                ? `${data.chart_count} indexed · ${failed} failed`
+                : `${data.chart_count} chart(s)`;
+            pathEl.classList.add('loaded');
+        } else {
+            pathEl.textContent = 'No chart data loaded';
+            pathEl.title = '';
+            countEl.textContent = '';
+            pathEl.classList.remove('loaded');
+            hideFolderLoadReport();
+        }
+    }
+
+    function fitMapToBounds(bounds, onComplete) {
+        if (!bounds || bounds.length !== 4) {
+            if (onComplete) onComplete();
+            return;
+        }
+        const extent = ol.proj.transformExtent(bounds, 'EPSG:4326', 'EPSG:3857');
+        const view = map.getView();
+        if (onComplete) {
+            const listenerKey = map.once('moveend', onComplete);
+            view.fit(extent, { padding: [40, 40, 40, 40], maxZoom: 12, duration: 600 });
+            if (!view.getAnimating()) {
+                ol.Observable.unByKey(listenerKey);
+                onComplete();
+            }
+        } else {
+            view.fit(extent, { padding: [40, 40, 40, 40], maxZoom: 12, duration: 600 });
+        }
+    }
+
+    function onDatasourceLoaded(data) {
+        datasourceReady = true;
+        updateDatasourceUI(data);
+        fetchAndRenderFolderReport(data.report);
+        showLoading(false);
+        map.updateSize();
+        const loadWhenReady = () => {
+            if (preslibReady) loadCharts();
+        };
+        if (data.bounds) {
+            fitMapToBounds(data.bounds, loadWhenReady);
+        } else {
+            loadWhenReady();
+        }
+    }
+
+    function setDatasourceButtonsDisabled(disabled) {
+        const browse = document.getElementById('btn-browse-folder');
+        if (browse) browse.disabled = disabled;
+    }
+
+    function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    function updateProgressUI(opts) {
+        const messageEl = document.getElementById('loading-message');
+        const progressEl = document.getElementById('loading-progress');
+        const detailEl = document.getElementById('loading-detail');
+        const indicator = document.getElementById('loading-indicator');
+
+        if (messageEl && opts.message != null) messageEl.textContent = opts.message;
+        if (detailEl) {
+            detailEl.textContent = opts.detail != null ? opts.detail : '';
+        }
+        if (progressEl) {
+            const indeterminate = !!opts.indeterminate;
+            if (indicator) indicator.classList.toggle('indeterminate', indeterminate);
+            if (indeterminate || opts.percent == null) {
+                progressEl.removeAttribute('value');
+            } else {
+                progressEl.value = Math.max(0, Math.min(100, opts.percent));
+            }
+        }
+    }
+
+    async function waitForDatasourceLoad() {
+        while (true) {
+            const resp = await fetch('/api/datasource/progress');
+            const p = await resp.json();
+
+            let detail = '';
+            if (p.total > 0 && p.phase !== 'scan') {
+                detail = `${p.current} / ${p.total}`;
+                if (p.percent > 0) detail += ` (${p.percent}%)`;
+            }
+
+            updateProgressUI({
+                message: p.message || 'Loading chart data…',
+                percent: p.total > 0 ? p.percent : null,
+                detail,
+                indeterminate: p.total <= 0 && p.status === 'running',
+            });
+
+            if (p.status === 'done') {
+                if (!p.result) {
+                    const ds = await fetch('/api/datasource').then(r => r.json());
+                    if (!ds.loaded) throw new Error('Load finished but chart data is unavailable.');
+                    return ds;
+                }
+                return p.result;
+            }
+            if (p.status === 'error') {
+                throw new Error(p.error || p.message || 'Failed to load chart data');
+            }
+            if (p.status === 'idle') {
+                throw new Error('Load was interrupted');
+            }
+
+            await sleep(300);
+        }
+    }
+
+    async function browseServerFolder() {
+        if (datasourceLoadActive) return;
+
+        hideFolderLoadReport();
+        showLoading(true);
+        setDatasourceButtonsDisabled(true);
+        datasourceLoadActive = true;
+        updateProgressUI({
+            message: 'Select folder in the dialog…',
+            percent: null,
+            detail: '',
+            indeterminate: true,
+        });
+
+        try {
+            const resp = await fetch('/api/datasource/browse?mode=replace', {
+                method: 'POST',
+            });
+            const data = await resp.json();
+            if (data.cancelled) {
+                showLoading(false);
+                return;
+            }
+            if (!resp.ok) throw new Error(data.detail || 'Failed to load folder');
+            if (data.status === 'started') {
+                const result = await waitForDatasourceLoad();
+                onDatasourceLoaded(result);
+                if (!preslibReady) showLoading(false);
+            } else if (data.loaded) {
+                onDatasourceLoaded(data);
+                if (!preslibReady) showLoading(false);
+            }
+        } catch (e) {
+            console.error(e);
+            alert('Could not load folder:\n' + e.message);
+            showLoading(false);
+        } finally {
+            datasourceLoadActive = false;
+            setDatasourceButtonsDisabled(false);
+        }
+    }
+
+    function isDefaultSampleLoaded(data) {
+        return data
+            && data.loaded
+            && data.mode === 'default'
+            && data.includes_default_sample;
+    }
+
+    async function waitForDefaultSampleReady() {
+        const resp = await fetch('/api/datasource/default', { method: 'POST' });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.detail || 'Failed to load default sample');
+        if (data.loaded) return data;
+        if (data.status === 'started') return waitForDatasourceLoad();
+        throw new Error('Unexpected response while loading default sample');
+    }
+
+    async function ensureDefaultSampleOnConnect() {
+        datasourceLoadActive = true;
+        setDatasourceButtonsDisabled(true);
+        showLoading(true);
+        updateProgressUI({
+            message: 'Loading default sample charts…',
+            percent: null,
+            detail: 'public/sample',
+            indeterminate: true,
+        });
+
+        try {
+            const dsResp = await fetch('/api/datasource');
+            const ds = await dsResp.json();
+
+            if (isDefaultSampleLoaded(ds)) {
+                onDatasourceLoaded(ds);
+                return;
+            }
+
+            const progResp = await fetch('/api/datasource/progress');
+            const prog = await progResp.json();
+
+            let result;
+            if (prog.status === 'running') {
+                result = await waitForDatasourceLoad();
+            } else {
+                result = await waitForDefaultSampleReady();
+            }
+
+            if (!isDefaultSampleLoaded(result)) {
+                result = await waitForDefaultSampleReady();
+            }
+            onDatasourceLoaded(result);
+        } catch (e) {
+            console.error('Default sample load failed:', e);
+            showLoading(false);
+            updateDatasourceUI(null);
+            map.updateSize();
+        } finally {
+            datasourceLoadActive = false;
+            setDatasourceButtonsDisabled(false);
+        }
     }
 
     map.getView().on('change:resolution', debouncedLoad);
@@ -180,7 +588,14 @@
     // --- UI ---
 
     function showLoading(show) {
-        document.getElementById('loading-indicator').classList.toggle('hidden', !show);
+        const el = document.getElementById('loading-indicator');
+        if (!el) return;
+        el.classList.toggle('hidden', !show);
+        el.setAttribute('aria-busy', show ? 'true' : 'false');
+    }
+
+    function setLoadingMessage(text) {
+        updateProgressUI({ message: text });
     }
 
     function updateInfo(charts, features) {
@@ -303,19 +718,9 @@
         map.getView().animate({ zoom, duration: 500 });
     });
 
-    // Manual / Disclaimer
+    // Disclaimer
     document.getElementById('btn-disclaimer').addEventListener('click', function () {
         alert('DISCLAIMER\n\nThis S-57 chart viewer is for demonstration and educational purposes only.\nIt cannot be used for navigation.\nThe chart data may not be current or accurate.\nAlways use official nautical charts for navigation.');
-    });
-
-    document.getElementById('btn-manual').addEventListener('click', function () {
-        alert('S-57 Web Viewer Manual\n\n' +
-            '1. Pan: Click and drag the map\n' +
-            '2. Zoom: Mouse wheel or +/- buttons\n' +
-            '3. Display Options: Toggle chart features on/off\n' +
-            '4. Click on features to see details\n' +
-            '5. Charts load automatically based on view extent and zoom level\n' +
-            '6. Higher zoom levels show more detailed charts');
     });
 
     async function initPreslib() {
@@ -326,11 +731,11 @@
             document.getElementById('map').style.backgroundColor = sea;
             updateLegendColors();
             vectorLayer.changed();
-            loadCharts();
+            if (datasourceReady) loadCharts();
         } catch (e) {
             console.error('S-52 PresLib load failed:', e);
-            document.getElementById('loading-indicator').querySelector('span').textContent =
-                'S-52 Presentation Library 로드 실패';
+            document.getElementById('map').style.backgroundColor = '#9fc5e8';
+            if (datasourceReady) loadCharts();
         }
     }
 
@@ -353,7 +758,27 @@
         if (circles[2]) circles[2].style.background = c('CHGRN0');
     }
 
+    document.getElementById('btn-browse-folder')?.addEventListener('click', browseServerFolder);
+
+    function loadVisitorStats() {
+        fetch('/api/visitors')
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (data) {
+                if (!data) return;
+                const todayEl = document.getElementById('visitor-today');
+                const totalEl = document.getElementById('visitor-total');
+                if (todayEl) todayEl.textContent = String(data.today ?? '—');
+                if (totalEl) totalEl.textContent = String(data.total ?? '—');
+            })
+            .catch(function () {});
+    }
+
+    map.updateSize();
+    window.addEventListener('resize', () => map.updateSize());
+
     initPreslib();
+    ensureDefaultSampleOnConnect();
+    loadVisitorStats();
 
     // Cursor style
     map.on('pointermove', function (evt) {

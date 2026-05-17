@@ -2,6 +2,8 @@
 
 대한민국 S-57 전자해도(ENC) 데이터를 웹 브라우저에서 조회하는 뷰어입니다.
 
+**GitHub:** [https://github.com/ejavm83/s57viewer](https://github.com/ejavm83/s57viewer)
+
 ## 요구 사항
 
 - Python 3.10+
@@ -12,8 +14,10 @@
 
 ```bash
 pip install -r requirements.txt
-uvicorn server:app --reload --host 0.0.0.0 --port 8000
+python -m uvicorn server:app --reload --host 127.0.0.1 --port 8000
 ```
+
+Windows에서는 `uvicorn` 명령이 PATH에 없을 수 있으므로 `python -m uvicorn`을 사용하거나 `run.bat`을 더블클릭하세요.
 
 브라우저에서 `http://localhost:8000` 을 엽니다.
 
@@ -29,9 +33,26 @@ uvicorn server:app --reload --host 0.0.0.0 --port 8000
 ### 1. Render (백엔드)
 
 1. [Render Dashboard](https://dashboard.render.com) → **New** → **Blueprint** → GitHub `ejavm83/s57viewer` 연결
-2. Persistent Disk(`/data`)에 S-57 `*.000` 파일 업로드 (SFTP/Shell)
-3. 환경 변수: `S57_DIR=/data/s57` (해도가 `s57` 하위 폴더에 있을 때)
-4. 배포 URL 예: `https://s57viewer.onrender.com`
+2. 배포 URL 예: `https://s57viewer.onrender.com`
+
+**Free 플랜** (`render.yaml` 기본): Persistent Disk를 쓸 수 없습니다. 뷰어 UI에서 S-57 폴더 **업로드**로 데이터를 넣거나, 이미지에 포함된 `public/sample` 샘플을 사용합니다. 캐시는 `/tmp/cache`(재시작 시 초기화)입니다.
+
+**Starter 이상 + 전체 해도 상주**가 필요하면 Blueprint에서 `plan: starter`로 바꾸고 `disk`·`S57_DIR`를 추가합니다:
+
+```yaml
+plan: starter
+envVars:
+  - key: S57_DIR
+    value: /data/s57
+  - key: CACHE_DIR
+    value: /data/cache
+disk:
+  name: s57-data
+  mountPath: /data
+  sizeGB: 10
+```
+
+배포 후 Render Shell/SFTP로 `/data/s57/`에 `*.000` 파일을 업로드합니다.
 
 ### 2. Vercel (프론트)
 
