@@ -7,7 +7,8 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt \
+    && python3 -c "import multipart; print('python-multipart OK')"
 
 COPY server.py .
 COPY scripts/ scripts/
