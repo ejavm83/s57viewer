@@ -6,12 +6,15 @@ import hashlib
 import shutil
 import time
 import asyncio
+import logging
+from collections import deque
 from datetime import date
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from fastapi import FastAPI, Query, File, UploadFile, HTTPException
+from fastapi import FastAPI, Query, File, UploadFile, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,9 +24,80 @@ from starlette.middleware.gzip import GZipMiddleware
 import pyogrio
 from pyogrio.raw import read as ogr_read
 
+logger = logging.getLogger("s57viewer")
+
+# HTTP paths polled often — not logged per request (progress is logged from _set_load_progress).
+_HTTP_QUIET_PATHS = frozenset({"/api/datasource/progress", "/health"})
+# Routine map pan/zoom; log only when slow or failed.
+_CHARTS_LOG_SLOW_MS = 400
+
 app = FastAPI()
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+def _format_http_log(
+    method: str,
+    path: str,
+    status: int,
+    elapsed_ms: float,
+    query: str,
+) -> str | None:
+    if path in _HTTP_QUIET_PATHS:
+        return None
+    if path == "/api/charts" and status == 200 and elapsed_ms < _CHARTS_LOG_SLOW_MS:
+        return None
+
+    label = _HTTP_PATH_LABELS.get(path)
+    if label is None and path.startswith("/api/datasource/sample/"):
+        label = "샘플 데이터셋 로드"
+    elif label is None and path.startswith("/api/chart/"):
+        label = "단일 차트 조회"
+    elif label is None and method == "GET" and path == "/":
+        label = "메인 페이지"
+    elif label is None:
+        label = path.removeprefix("/api/") or path
+
+    if path == "/api/charts":
+        zoom = ""
+        for part in query.split("&"):
+            if part.startswith("zoom="):
+                zoom = part[5:]
+                break
+        zoom_note = f", zoom {zoom}" if zoom else ""
+        return f"{label} — HTTP {status}, {elapsed_ms:.0f}ms{zoom_note}"
+
+    verb = {"GET": "조회", "POST": "요청", "PUT": "변경", "DELETE": "삭제"}.get(method, method)
+    return f"{label} ({verb}) — HTTP {status}, {elapsed_ms:.0f}ms"
+
+
+@app.middleware("http")
+async def log_http_requests(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api/admin/logs"):
+        return await call_next(request)
+    start = time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    except Exception:
+        logger.exception("요청 처리 오류: %s %s", request.method, path)
+        raise
+    finally:
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        if path.startswith("/api/") or path in ("/", "/health"):
+            msg = _format_http_log(
+                request.method, path, status_code, elapsed_ms, request.url.query
+            )
+            if msg:
+                if status_code >= 500:
+                    logger.error(msg)
+                elif status_code >= 400:
+                    logger.warning(msg)
+                else:
+                    logger.info(msg)
 
 VIEWPORT_PAD_RATIO = 0.08
 MAX_FEATURES_RESPONSE = 100_000
@@ -62,19 +136,303 @@ DEFAULT_SAMPLE_DIR = (
     if os.environ.get("DEFAULT_SAMPLE_DIR")
     else _resolve_default_sample_dir()
 )
+
+# WGS84 min/max lon/lat — bundled default sample only: skip ENC cells that do not overlap this
+# box (fewer charts → faster index & first map load). Set DEFAULT_SAMPLE_INDEX_BOUNDS=all to index every .000.
+KOREA_DEFAULT_SAMPLE_INDEX_BOUNDS: tuple[float, float, float, float] = (
+    123.95,
+    33.45,
+    131.05,
+    38.72,
+)
+
+
+def _wgs84_bounds_overlap(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> bool:
+    return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
+
+
+def _use_default_sample_index_bounds_filter() -> bool:
+    """Narrow index only for the single-folder bundled default demo (not user uploads / multi-root)."""
+    if len(chart_source_dirs) != 1 or datasource_mode != "default":
+        return False
+    try:
+        return chart_source_dirs[0].resolve() == DEFAULT_SAMPLE_DIR.resolve()
+    except OSError:
+        return False
+
+
+def _default_sample_index_clip_bounds() -> tuple[float, float, float, float] | None:
+    """WGS84 box [west,south,east,north] to intersect; None = index all .000 in the default folder."""
+    if not _use_default_sample_index_bounds_filter():
+        return None
+    raw = (os.environ.get("DEFAULT_SAMPLE_INDEX_BOUNDS") or "").strip()
+    if raw.lower() in ("all", "full", "none", "off", "0"):
+        return None
+    if not raw:
+        return KOREA_DEFAULT_SAMPLE_INDEX_BOUNDS
+    parts = [p.strip() for p in raw.split(",")]
+    if len(parts) != 4:
+        logger.warning(
+            "DEFAULT_SAMPLE_INDEX_BOUNDS must be west,south,east,north — ignoring invalid value %r",
+            raw,
+        )
+        return KOREA_DEFAULT_SAMPLE_INDEX_BOUNDS
+    try:
+        w, s, e, n = (float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]))
+    except ValueError:
+        logger.warning("DEFAULT_SAMPLE_INDEX_BOUNDS has non-numeric parts — using built-in Korea clip")
+        return KOREA_DEFAULT_SAMPLE_INDEX_BOUNDS
+    return (w, s, e, n)
+
+
+def _sample_index_bounds_sig(clip: tuple[float, float, float, float] | None) -> str:
+    if clip is None:
+        return "none"
+    return f"{clip[0]:.5f},{clip[1]:.5f},{clip[2]:.5f},{clip[3]:.5f}"
+
+
 UPLOAD_DIR = CACHE_DIR / "uploads"
+DATASOURCE_STATE_FILE = CACHE_DIR / "datasource_state.json"
 chart_source_dirs: list[Path] = []
 datasource_mode: str = "default"
 CACHE_DIR.mkdir(exist_ok=True)
 UPLOAD_DIR.mkdir(exist_ok=True)
+LOG_DIR = CACHE_DIR / "logs"
+LOG_FILE = LOG_DIR / "app.log"
+LOG_DIR.mkdir(exist_ok=True)
 VIEWPORT_RESPONSE_DIR = CACHE_DIR / "viewport_responses"
 VIEWPORT_RESPONSE_DIR.mkdir(exist_ok=True)
+
+_log_records: deque = deque(maxlen=4000)
+_log_buf_lock = Lock()
+_last_progress_log_key = ""
+
+_HTTP_PATH_LABELS: dict[str, str] = {
+    "/": "메인 페이지",
+    "/api/datasource": "데이터 소스 상태",
+    "/api/datasource/default": "기본 샘플 로드",
+    "/api/datasource/browse": "폴더 선택 로드",
+    "/api/datasource/upload": "파일 업로드",
+    "/api/datasource/report": "로드 리포트",
+    "/api/datasource/samples": "샘플 목록",
+    "/api/charts": "지도 레이어",
+    "/api/index": "차트 인덱스",
+    "/api/categories": "레이어 카테고리",
+    "/api/s52-settings": "S-52 설정",
+    "/api/s57-settings": "S-52 설정",
+    "/api/visitors": "방문자",
+    "/api/admin/status": "관리자 상태",
+}
+
+
+class _ServerLogFilter(logging.Filter):
+    """Short, readable uvicorn / watchfiles lines on the console."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        if "WatchFiles detected changes" in msg:
+            record.msg = "코드 변경 감지 — 서버 재시작 중…"
+            record.args = ()
+        elif msg.startswith("Started server process"):
+            record.msg = "서버 워커 시작"
+            record.args = ()
+        elif msg == "Waiting for application startup.":
+            record.msg = "앱 초기화 중…"
+            record.args = ()
+        elif msg == "Application startup complete.":
+            record.msg = "서버 준비 완료 — 요청을 받을 수 있습니다"
+            record.args = ()
+        elif msg.startswith("Shutting down"):
+            record.msg = "서버 종료 중…"
+            record.args = ()
+        elif msg.startswith("Waiting for application shutdown."):
+            record.msg = "앱 종료 처리 중…"
+            record.args = ()
+        elif msg == "Application shutdown complete.":
+            record.msg = "서버 종료 완료"
+            record.args = ()
+        elif msg == "Finished server process":
+            record.msg = "서버 프로세스 종료"
+            record.args = ()
+        elif "Uvicorn running on" in msg:
+            record.msg = msg.replace("Uvicorn running on", "서버 주소")
+            record.args = ()
+        elif '"GET ' in msg or '"POST ' in msg:
+            return False
+        return True
+
+
+class _RingBufferHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            entry = _log_record_to_dict(record)
+            with _log_buf_lock:
+                _log_records.append(entry)
+        except Exception:
+            self.handleError(record)
+
+
+def _log_record_to_dict(record: logging.LogRecord) -> dict:
+    return {
+        "ts": record.created,
+        "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(record.created)),
+        "level": record.levelname,
+        "logger": record.name,
+        "message": record.getMessage(),
+    }
+
+
+def _configure_app_logging() -> None:
+    root = logging.getLogger("s57viewer")
+    if root.handlers:
+        return
+    root.setLevel(logging.DEBUG)
+    file_fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    console_fmt = logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
+
+    console = logging.StreamHandler()
+    console.setFormatter(console_fmt)
+    console.setLevel(logging.INFO)
+    root.addHandler(console)
+
+    ring = _RingBufferHandler()
+    ring.setFormatter(file_fmt)
+    root.addHandler(ring)
+    try:
+        file_handler = RotatingFileHandler(
+            LOG_FILE,
+            maxBytes=2_000_000,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(file_fmt)
+        root.addHandler(file_handler)
+    except OSError as exc:
+        import sys
+        print(f"Warning: could not open log file {LOG_FILE}: {exc}", file=sys.stderr)
+
+
+def _uvicorn_log_config() -> dict:
+    return {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "human": {
+                "format": "[%(asctime)s] %(message)s",
+                "datefmt": "%H:%M:%S",
+            },
+        },
+        "filters": {
+            "friendly": {"()": "server._ServerLogFilter"},
+        },
+        "handlers": {
+            "console": {
+                "class": "logging.StreamHandler",
+                "formatter": "human",
+                "filters": ["friendly"],
+                "stream": "ext://sys.stderr",
+            },
+        },
+        "loggers": {
+            "uvicorn": {"handlers": ["console"], "level": "INFO", "propagate": False},
+            "uvicorn.error": {"handlers": ["console"], "level": "INFO", "propagate": False},
+            "uvicorn.access": {"handlers": [], "level": "CRITICAL", "propagate": False},
+            "watchfiles": {"handlers": ["console"], "level": "WARNING", "propagate": False},
+        },
+    }
+
+
+_configure_app_logging()
+
+
+def _parse_log_line(line: str) -> dict | None:
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        if len(line) >= 19 and line[4] == "-" and line[10] == " ":
+            time_part = line[:19]
+            rest = line[20:]
+            level, _, message = rest.partition(" ")
+            if level in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+                logger_name = ""
+                if ": " in message:
+                    logger_name, _, message = message.partition(": ")
+                return {
+                    "ts": time.mktime(time.strptime(time_part, "%Y-%m-%d %H:%M:%S")),
+                    "time": time_part,
+                    "level": level,
+                    "logger": logger_name,
+                    "message": message,
+                }
+    except (ValueError, OSError):
+        pass
+    return {"ts": time.time(), "time": "", "level": "INFO", "logger": "", "message": line}
+
+
+def _read_log_file_tail(max_lines: int) -> list[dict]:
+    if not LOG_FILE.is_file() or max_lines <= 0:
+        return []
+    try:
+        with open(LOG_FILE, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    entries: list[dict] = []
+    for line in lines[-max_lines:]:
+        entry = _parse_log_line(line)
+        if entry:
+            entries.append(entry)
+    return entries
+
+
+def _collect_log_entries(*, max_lines: int = 500, level: str | None = None) -> list[dict]:
+    level_filter = (level or "").upper()
+    with _log_buf_lock:
+        buffer_entries = list(_log_records)
+    file_entries = _read_log_file_tail(max_lines * 2)
+    merged: dict[tuple, dict] = {}
+    for entry in file_entries + buffer_entries:
+        key = (entry.get("time"), entry.get("level"), entry.get("message"))
+        merged[key] = entry
+    entries = sorted(merged.values(), key=lambda e: e.get("ts", 0))
+    if level_filter:
+        entries = [e for e in entries if e.get("level") == level_filter]
+    return entries[-max_lines:]
+
+
+def _require_admin_access(request: Request) -> None:
+    expected_key = os.environ.get("ADMIN_LOG_KEY", "").strip()
+    if expected_key:
+        provided = request.headers.get("X-S57-Admin-Key", "")
+        if provided == expected_key:
+            return
+        raise HTTPException(status_code=403, detail="Admin log access denied.")
+    client = request.client
+    host = (client.host if client else "").lower()
+    if host in ("127.0.0.1", "::1", "localhost"):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail="Admin logs are only available on localhost (or set ADMIN_LOG_KEY).",
+    )
+def _executor_workers(default: int, cap: int) -> int:
+    """Keep GDAL/pyogrio thread pools small on Render free tier (512MB RAM)."""
+    if os.environ.get("RENDER") == "true":
+        try:
+            cpus = float(os.environ.get("RENDER_CPU_COUNT", "0.5"))
+        except ValueError:
+            cpus = 0.5
+        return max(1, min(cap, int(cpus * 4) or 1))
+    return min(default, os.cpu_count() or 4)
+
+
 _CHARTS_POOL = ThreadPoolExecutor(
-    max_workers=min(8, (os.cpu_count() or 4)),
+    max_workers=_executor_workers(12, 6),
     thread_name_prefix="s57charts",
 )
 _LAYER_POOL = ThreadPoolExecutor(
-    max_workers=min(6, (os.cpu_count() or 4)),
+    max_workers=_executor_workers(6, 3),
     thread_name_prefix="s57layer",
 )
 
@@ -91,6 +449,10 @@ _load_progress: dict = {
     "percent": 0,
     "error": None,
     "result": None,
+    "files_found": 0,
+    "indexed_ok": 0,
+    "indexed_failed": 0,
+    "current_file": "",
 }
 VISITORS_FILE = CACHE_DIR / "visitors.json"
 
@@ -122,8 +484,9 @@ DISPLAY_CATEGORIES = {
     "wreck": ["WRECKS"],
     "land": ["LNDARE", "LNDMRK", "LNDELV", "LNDRGN", "LAKARE"],
     "coastline": ["COALNE", "SLCONS"],
-    "navigation": ["DWRTPT", "TWRTPT", "FERYRT", "RDOCAL", "RDOSTA", "ACHBRT", "CTRPNT",
-                   "PILPNT", "PILBOP", "RESARE", "TSSBND", "TSELNE", "ISTZNE"],
+    "traffic": ["RESARE", "TSSBND", "TSELNE", "ISTZNE", "TSSLPT", "TSSRON", "ACHBRT", "ACHARE"],
+    "navigation": ["DWRTPT", "TWRTPT", "FAIRWY", "FERYRT", "RDOCAL", "RDOSTA", "CTRPNT",
+                   "PILPNT", "PILBOP"],
     "infrastructure": ["BRIDGE", "CBLOHD", "CBLSUB", "PIPSOL", "MORFAC", "DAMCON", "PONTON", "PYLONS"],
     "coverage": ["M_COVR", "M_QUAL"],
 }
@@ -167,7 +530,32 @@ SCALE_BAND_NOMINAL_DENOM = {
 }
 
 # Bump when chart quilting / viewport response shape changes (invalidates disk cache).
-CHARTS_API_VERSION = 2
+CHARTS_API_VERSION = 5
+
+
+def _viewport_intersection_area(
+    bounds: tuple[float, float, float, float],
+    west: float,
+    south: float,
+    east: float,
+    north: float,
+) -> float:
+    iw = max(0.0, min(bounds[2], east) - max(bounds[0], west))
+    ih = max(0.0, min(bounds[3], north) - max(bounds[1], south))
+    return iw * ih
+
+
+def _chart_viewport_rank(
+    info: dict,
+    west: float,
+    south: float,
+    east: float,
+    north: float,
+    primary_scale: int,
+) -> tuple:
+    overlap = _viewport_intersection_area(info["bounds"], west, south, east, north)
+    scale_dist = abs(info["scale"] - primary_scale)
+    return (-overlap, scale_dist, info["bounds"][0], info["bounds"][1])
 
 
 def _primary_scale_band_for_zoom(zoom: int) -> int:
@@ -246,6 +634,63 @@ def _apply_chart_sources(mode: str, user_root: Path | None) -> None:
         S57_DIR = user_root.resolve()
     else:
         S57_DIR = DEFAULT_SAMPLE_DIR.resolve()
+
+
+def _save_datasource_state() -> None:
+    if not chart_source_dirs:
+        return
+    state = {
+        "mode": datasource_mode,
+        "chart_source_dirs": [str(p.resolve()) for p in chart_source_dirs],
+        "chart_count": len(chart_index),
+    }
+    try:
+        tmp = DATASOURCE_STATE_FILE.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        tmp.replace(DATASOURCE_STATE_FILE)
+    except OSError as exc:
+        logger.warning("Could not save datasource state: %s", exc)
+
+
+def _load_datasource_state() -> dict | None:
+    if not DATASOURCE_STATE_FILE.is_file():
+        return None
+    try:
+        with open(DATASOURCE_STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _restore_persisted_datasource() -> bool:
+    """Resume last user-selected folder after dev-server reload, if still on disk."""
+    if os.environ.get("S57_DIR"):
+        return False
+    state = _load_datasource_state()
+    if not state:
+        return False
+    mode = _normalize_load_mode(state.get("mode", "replace"))
+    if mode == "default":
+        return False
+    raw_dirs = state.get("chart_source_dirs") or []
+    roots: list[Path] = []
+    for item in raw_dirs:
+        p = Path(item)
+        if p.is_dir() and _dir_has_charts(p):
+            roots.append(p.resolve())
+    if not roots:
+        return False
+    default_resolved = DEFAULT_SAMPLE_DIR.resolve()
+    if mode == "add":
+        user_root = next((p for p in roots if p != default_resolved), None)
+        if not user_root:
+            return False
+        _apply_chart_sources("add", user_root)
+    else:
+        _apply_chart_sources("replace", roots[0])
+    return True
 
 
 def _iter_indexed_chart_files() -> list[tuple[str, Path]]:
@@ -364,6 +809,9 @@ def index_cache_path() -> Path | None:
     if not chart_source_dirs:
         return None
     key_src = "|".join(str(p.resolve()) for p in chart_source_dirs)
+    clip = _default_sample_index_clip_bounds()
+    if clip is not None:
+        key_src += "|clip=" + _sample_index_bounds_sig(clip)
     key = hashlib.md5(key_src.encode()).hexdigest()[:16]
     return CACHE_DIR / f"chart_index_{key}.json"
 
@@ -395,6 +843,27 @@ def _layer_frequency(entries: dict, limit: int = 12) -> list[dict]:
     return [{"layer": name, "charts": count} for name, count in ranked[:limit]]
 
 
+def _enrich_indexed_entries(indexed: list[dict]) -> list[dict]:
+    """Attach path, source, and layer list from chart_index for detailed reports."""
+    enriched: list[dict] = []
+    for entry in indexed:
+        name = entry.get("name")
+        info = chart_index.get(name) if name else None
+        if not info:
+            enriched.append(entry)
+            continue
+        item = dict(entry)
+        item["path"] = info.get("path", "")
+        item["source"] = info.get("source", "")
+        layers = list(info.get("layers", []))
+        item["layers"] = layers
+        scale = entry.get("scale")
+        if scale is not None:
+            item["nominal_scale"] = SCALE_BAND_NOMINAL_DENOM.get(int(scale))
+        enriched.append(item)
+    return enriched
+
+
 def _build_load_report(
     *,
     files_found: int,
@@ -402,9 +871,11 @@ def _build_load_report(
     failed: list[dict],
     from_cache: bool,
     duration_sec: float | None = None,
+    skipped_bounds: list[dict] | None = None,
 ) -> dict:
     indexed_ok = len(indexed)
     failed_count = len(failed)
+    skipped_bounds = skipped_bounds or []
     scale_counts = {}
     for item in indexed:
         band = str(item["scale"])
@@ -415,6 +886,7 @@ def _build_load_report(
         "files_found": files_found,
         "indexed_ok": indexed_ok,
         "indexed_failed": failed_count,
+        "skipped_outside_bounds": len(skipped_bounds),
         "from_cache": from_cache,
         "duration_sec": round(duration_sec, 2) if duration_sec is not None else None,
         "scale_bands": {
@@ -431,6 +903,9 @@ def _build_load_report(
             "avg": round(sum(layer_counts) / len(layer_counts), 1) if layer_counts else 0,
         },
         "top_layers": _layer_frequency(chart_index),
+        "all_layers": _layer_frequency(chart_index, limit=9999),
+        "total_layer_instances": sum(len(info.get("layers", [])) for info in chart_index.values()),
+        "unique_layers": len({layer for info in chart_index.values() for layer in info.get("layers", [])}),
     }
     return {
         "generated_at": time.time(),
@@ -438,8 +913,9 @@ def _build_load_report(
         "paths": [str(p) for p in chart_source_dirs],
         "mode": datasource_mode,
         "summary": summary,
-        "indexed": indexed,
+        "indexed": _enrich_indexed_entries(indexed),
         "failed": failed,
+        "skipped_bounds": skipped_bounds,
     }
 
 
@@ -450,16 +926,37 @@ def _finalize_load_report(
     *,
     from_cache: bool,
     started_at: float | None = None,
+    skipped_bounds: list[dict] | None = None,
 ) -> dict:
     global last_load_report
     duration = (time.time() - started_at) if started_at else None
+    skipped_bounds = skipped_bounds or []
     last_load_report = _build_load_report(
         files_found=files_found,
         indexed=indexed_entries,
         failed=failed_entries,
         from_cache=from_cache,
         duration_sec=duration,
+        skipped_bounds=skipped_bounds,
     )
+    summary = last_load_report["summary"]
+    cache_note = " (cache)" if from_cache else ""
+    duration_note = f", {summary['duration_sec']}s" if summary.get("duration_sec") is not None else ""
+    logger.info(
+        "로드 리포트%s: .000 %d개, 성공 %d, 실패 %d, 범위외 제외 %d%s — %s",
+        cache_note,
+        summary["files_found"],
+        summary["indexed_ok"],
+        summary["indexed_failed"],
+        summary.get("skipped_outside_bounds", 0),
+        duration_note,
+        _format_datasource_paths() or "(경로 없음)",
+    )
+    if failed_entries:
+        for item in failed_entries[:5]:
+            logger.warning("Chart index failed: %s — %s", item.get("file"), item.get("error"))
+        if len(failed_entries) > 5:
+            logger.warning("… and %d more failed chart(s)", len(failed_entries) - 5)
     return last_load_report
 
 
@@ -517,6 +1014,10 @@ def _progress_snapshot() -> dict:
             "message": _load_progress["message"],
             "percent": _load_progress["percent"],
             "error": _load_progress["error"],
+            "files_found": _load_progress.get("files_found", 0),
+            "indexed_ok": _load_progress.get("indexed_ok", 0),
+            "indexed_failed": _load_progress.get("indexed_failed", 0),
+            "current_file": _load_progress.get("current_file", ""),
         }
         if _load_progress["status"] == "done" and _load_progress["result"] is not None:
             snap["result"] = _load_progress["result"]
@@ -532,6 +1033,10 @@ def _set_load_progress(
     status: str | None = None,
     error: str | None = None,
     result: dict | None = None,
+    files_found: int | None = None,
+    indexed_ok: int | None = None,
+    indexed_failed: int | None = None,
+    current_file: str | None = None,
 ) -> None:
     with _load_progress_lock:
         if status is not None:
@@ -550,6 +1055,52 @@ def _set_load_progress(
             _load_progress["error"] = error
         if result is not None:
             _load_progress["result"] = result
+        if files_found is not None:
+            _load_progress["files_found"] = files_found
+        if indexed_ok is not None:
+            _load_progress["indexed_ok"] = indexed_ok
+        if indexed_failed is not None:
+            _load_progress["indexed_failed"] = indexed_failed
+        if current_file is not None:
+            _load_progress["current_file"] = current_file
+    _emit_load_progress_log()
+
+
+def _emit_load_progress_log() -> None:
+    global _last_progress_log_key
+    with _load_progress_lock:
+        status = _load_progress["status"]
+        phase = _load_progress["phase"]
+        pct = _load_progress["percent"]
+        current = _load_progress["current"]
+        total = _load_progress["total"]
+        message = _load_progress["message"]
+        error = _load_progress.get("error")
+
+    if status == "idle":
+        return
+
+    if status in ("done", "error"):
+        key = status
+    elif phase == "index" and total > 0:
+        key = f"index:{pct // 10}"
+    else:
+        key = f"{status}:{phase}:{message[:48]}"
+
+    if key == _last_progress_log_key:
+        return
+    _last_progress_log_key = key
+
+    if status == "done":
+        logger.info("차트 로드 완료 — %s", message)
+    elif status == "error":
+        logger.error("차트 로드 실패 — %s", error or message)
+    elif phase == "index" and total > 0:
+        logger.info("차트 인덱싱 %d%% — %s (%d/%d)", pct, message, current, total)
+    elif phase == "scan":
+        logger.info("차트 폴더 스캔 — %s", message)
+    else:
+        logger.info("차트 로드 — %s", message)
 
 
 def _datasource_result_payload() -> dict:
@@ -573,11 +1124,23 @@ def _load_datasource_worker(root: Path | None, mode: str = "replace") -> None:
         else:
             raise ValueError("No chart folder specified.")
 
-        _set_load_progress("scan", 0, 0, "Scanning for .000 chart files…", status="running")
+        path_label = _format_datasource_paths() or str(root)
+        logger.info("차트 폴더 로드 시작 (mode=%s): %s", mode, path_label)
+        _set_load_progress("scan", 0, 0, ".000 차트 파일 검색 중…", status="running")
         _apply_chart_sources(mode, root)
         chart_files = _iter_indexed_chart_files()
+        files_found = len(chart_files)
         if not chart_files:
             raise ValueError("No .000 chart files found in the configured data source(s).")
+
+        logger.info("스캔 완료: %d개 .000 파일 (%s)", files_found, path_label)
+        _set_load_progress(
+            "scan",
+            0,
+            files_found,
+            f"Found {files_found} .000 chart file(s) — building index…",
+            files_found=files_found,
+        )
 
         clear_viewport_response_cache()
         chart_index = {}
@@ -585,6 +1148,7 @@ def _load_datasource_worker(root: Path | None, mode: str = "replace") -> None:
 
         result = _datasource_result_payload()
         mode_label = {"default": "default sample", "add": "added to sample", "replace": "replaced"}[mode]
+        _save_datasource_state()
         _set_load_progress(
             "done",
             len(chart_index),
@@ -604,8 +1168,24 @@ def _load_datasource_worker(root: Path | None, mode: str = "replace") -> None:
         )
 
 
-def _index_progress_callback(current: int, total: int, message: str) -> None:
-    _set_load_progress("index", current, total, message)
+def _index_progress_callback(
+    current: int,
+    total: int,
+    message: str,
+    *,
+    indexed_ok: int | None = None,
+    indexed_failed: int | None = None,
+    current_file: str | None = None,
+) -> None:
+    _set_load_progress(
+        "index",
+        current,
+        total,
+        message,
+        indexed_ok=indexed_ok,
+        indexed_failed=indexed_failed,
+        current_file=current_file,
+    )
 
 
 def _start_datasource_load(
@@ -614,6 +1194,7 @@ def _start_datasource_load(
     mode: str = "replace",
     already_running: bool = False,
 ) -> None:
+    global _last_progress_log_key
     with _load_progress_lock:
         if not already_running:
             if _load_progress["status"] == "running":
@@ -622,6 +1203,11 @@ def _start_datasource_load(
             _load_progress["error"] = None
             _load_progress["result"] = None
             _load_progress["percent"] = 0
+            _load_progress["files_found"] = 0
+            _load_progress["indexed_ok"] = 0
+            _load_progress["indexed_failed"] = 0
+            _load_progress["current_file"] = ""
+    _last_progress_log_key = ""
 
     loop = asyncio.get_event_loop()
     loop.run_in_executor(None, _load_datasource_worker, root, mode)
@@ -647,6 +1233,7 @@ def set_datasource(root: Path, mode: str = "replace") -> dict:
         chart_index = {}
         build_chart_index()
 
+    _save_datasource_state()
     return _datasource_result_payload()
 
 
@@ -786,9 +1373,16 @@ def parse_wkb_multipolygon(wkb: bytes):
     return {"type": "MultiPolygon", "coordinates": polygons}
 
 
-# S-57 line features (cables, pipelines) often store disjoint legs as one vertex chain.
-# Connecting those legs draws long spurious chords; split at large coordinate gaps.
+# S-57 line features (e.g. some TSS / admin boundaries) sometimes chain disjoint legs in one
+# vertex list. Connecting those legs draws spurious chords — split when a step exceeds the gap.
 LINE_VERTEX_GAP_DEG = 0.025
+# Cables / pipelines / long infrastructure lines often have legitimately sparse vertices ( ≫ 0.025°
+# apart). Using the default gap falsely splits one feature and **drops** the long edge (see
+# _split_line_coords: large gaps end a part and start a new part without drawing the jump).
+LINE_SPARSE_VERTEX_GAP_DEG = 2.5
+LINE_SPARSE_VERTEX_LAYERS = frozenset(
+    {"CBLSUB", "CBLOHD", "PIPSOL", "BRIDGE", "MORFAC", "DAMCON", "PONTON", "PYLONS", "HULKES"}
+)
 
 
 def _split_line_coords(coords: list, max_gap_deg: float = LINE_VERTEX_GAP_DEG) -> list[list]:
@@ -809,19 +1403,26 @@ def _split_line_coords(coords: list, max_gap_deg: float = LINE_VERTEX_GAP_DEG) -
     return parts
 
 
-def _normalize_line_geometry(geom: dict | None) -> dict | None:
+def _line_split_gap_deg_for_layer(layer: str | None) -> float:
+    if layer and layer in LINE_SPARSE_VERTEX_LAYERS:
+        return LINE_SPARSE_VERTEX_GAP_DEG
+    return LINE_VERTEX_GAP_DEG
+
+
+def _normalize_line_geometry(geom: dict | None, layer: str | None = None) -> dict | None:
     if not geom:
         return geom
+    max_gap = _line_split_gap_deg_for_layer(layer)
     gtype = geom.get("type")
     if gtype == "LineString":
-        parts = _split_line_coords(geom["coordinates"])
+        parts = _split_line_coords(geom["coordinates"], max_gap_deg=max_gap)
         if len(parts) <= 1:
             return geom
         return {"type": "MultiLineString", "coordinates": parts}
     if gtype == "MultiLineString":
         parts: list[list] = []
         for line in geom["coordinates"]:
-            parts.extend(_split_line_coords(line))
+            parts.extend(_split_line_coords(line, max_gap_deg=max_gap))
         if not parts:
             return geom
         if len(parts) == 1 and len(geom["coordinates"]) == 1:
@@ -915,7 +1516,7 @@ def _write_s52_settings_file(settings: dict) -> None:
     try:
         path.write_text(json.dumps(settings, separators=(",", ":")), encoding="utf-8")
     except OSError as exc:
-        print(f"Warning: could not write {path.name}: {exc}")
+        logger.warning("Could not write %s: %s", path.name, exc)
 
 
 def refresh_s52_mariner_settings() -> dict:
@@ -1023,72 +1624,123 @@ def get_scale_from_filename(filename: str) -> int:
 def build_chart_index(on_progress=None):
     global chart_index
     if not chart_source_dirs:
-        print("No chart sources configured, skipping index build")
+        logger.info("No chart sources configured, skipping index build")
         return
 
     started_at = time.time()
     chart_file_entries = _iter_indexed_chart_files()
     files_found = len(chart_file_entries)
     file_keys = {key for key, _ in chart_file_entries}
+    clip_bounds = _default_sample_index_clip_bounds()
 
     cache_path = index_cache_path()
     if cache_path and cache_path.exists():
         if on_progress:
             on_progress(0, 0, "Loading chart index from cache…")
         with open(cache_path, "r", encoding="utf-8") as f:
-            loaded = json.load(f)
-        with _datasource_lock:
-            chart_index = loaded
-        print(f"Loaded chart index from cache: {len(chart_index)} charts")
-        indexed_entries = [
-            {
-                "name": name,
-                "file": _chart_display_name(name),
-                "scale": info["scale"],
-                "scale_label": SCALE_BAND_LABELS.get(info["scale"], f"Band {info['scale']}"),
-                "layer_count": len(info.get("layers", [])),
-                "bounds": info["bounds"],
-            }
-            for name, info in sorted(chart_index.items())
-        ]
-        index_keys = set(chart_index.keys())
-        failed_entries = [
-            {"name": key, "file": _chart_display_name(key), "error": "Not indexed (missing from cache)"}
-            for key in sorted(file_keys - index_keys)
-        ]
-        failed_entries.extend(
-            {
-                "name": key,
-                "file": _chart_display_name(key),
-                "error": "Indexed but source file no longer present",
-            }
-            for key in sorted(index_keys - file_keys)
-        )
-        _finalize_load_report(
-            files_found,
-            indexed_entries,
-            failed_entries,
-            from_cache=True,
-            started_at=started_at,
-        )
-        if on_progress:
-            n = len(chart_index)
-            on_progress(n, n, f"Loaded {n} chart(s) from cache")
-        refresh_s52_mariner_settings()
-        return
+            loaded_raw = json.load(f)
+        if not isinstance(loaded_raw, dict):
+            loaded_raw = {}
+        meta = loaded_raw.pop("__index_meta__", None)
+        loaded = loaded_raw
+        loaded_keys = set(loaded.keys())
 
-    print(f"Building chart index from {len(chart_source_dirs)} source(s)…")
+        if clip_bounds is not None:
+            cache_ok = (
+                isinstance(meta, dict)
+                and meta.get("bounds_sig") == _sample_index_bounds_sig(clip_bounds)
+                and set(meta.get("disk_keys", [])) == file_keys
+                and loaded_keys <= file_keys
+            )
+        else:
+            cache_ok = file_keys.issubset(loaded_keys) and len(loaded_keys) == len(file_keys)
+
+        if not cache_ok:
+            logger.info(
+                "Chart index cache stale (%d cached, %d on disk, clip=%s); rebuilding",
+                len(loaded_keys),
+                len(file_keys),
+                _sample_index_bounds_sig(clip_bounds),
+            )
+        else:
+            with _datasource_lock:
+                chart_index = loaded
+            logger.info("Loaded chart index from cache: %d charts", len(chart_index))
+            indexed_entries = [
+                {
+                    "name": name,
+                    "file": _chart_display_name(name),
+                    "scale": info["scale"],
+                    "scale_label": SCALE_BAND_LABELS.get(info["scale"], f"Band {info['scale']}"),
+                    "layer_count": len(info.get("layers", [])),
+                    "bounds": info["bounds"],
+                }
+                for name, info in sorted(chart_index.items())
+            ]
+            index_keys = set(chart_index.keys())
+            failed_entries: list[dict] = []
+            if clip_bounds is None:
+                failed_entries = [
+                    {"name": key, "file": _chart_display_name(key), "error": "Not indexed (missing from cache)"}
+                    for key in sorted(file_keys - index_keys)
+                ]
+            failed_entries.extend(
+                {
+                    "name": key,
+                    "file": _chart_display_name(key),
+                    "error": "Indexed but source file no longer present",
+                }
+                for key in sorted(index_keys - file_keys)
+            )
+            _finalize_load_report(
+                files_found,
+                indexed_entries,
+                failed_entries,
+                from_cache=True,
+                started_at=started_at,
+                skipped_bounds=[],
+            )
+            if on_progress:
+                n = len(chart_index)
+                on_progress(
+                    n,
+                    n,
+                    f"Loaded {n} chart(s) from cache",
+                    indexed_ok=len(indexed_entries),
+                    indexed_failed=len(failed_entries),
+                )
+            refresh_s52_mariner_settings()
+            return
+
+    logger.info(
+        "Building chart index from %d source(s); default-sample clip=%s",
+        len(chart_source_dirs),
+        _sample_index_bounds_sig(clip_bounds),
+    )
     total = files_found
     if on_progress:
-        on_progress(0, total, f"Indexing charts (0/{total})…")
+        on_progress(
+            0,
+            total,
+            f"Indexing charts (0/{total})…",
+            indexed_ok=0,
+            indexed_failed=0,
+        )
+
+    with _datasource_lock:
+        chart_index = {}
 
     indexed_entries: list[dict] = []
     failed_entries: list[dict] = []
+    skipped_bounds: list[dict] = []
 
     def process_file(chart_key: str, fpath: Path):
         try:
             info = pyogrio.read_info(str(fpath), layer="M_COVR")
             bounds = info["total_bounds"]
+            tb = tuple(float(x) for x in bounds)
+            if clip_bounds is not None and not _wgs84_bounds_overlap(tb, clip_bounds):
+                return chart_key, None, None, "outside_demo_bounds"
             layers = [l[0] for l in pyogrio.list_layers(str(fpath))]
             feature_layers = [l for l in layers if l in FEATURE_LAYERS]
             scale = get_scale_from_filename(fpath.stem)
@@ -1124,41 +1776,80 @@ def build_chart_index(on_progress=None):
                 with _datasource_lock:
                     chart_index[name] = data
                 indexed_entries.append(entry)
+            elif err == "outside_demo_bounds":
+                skipped_bounds.append({
+                    "name": name,
+                    "file": _chart_display_name(name),
+                    "reason": "outside DEFAULT_SAMPLE_INDEX_BOUNDS (demo clip)",
+                })
             else:
                 failed_entries.append({
                     "name": name,
                     "file": _chart_display_name(name),
                     "error": err or "Unknown error",
                 })
+            display_name = _chart_display_name(name)
+            ok_count = len(indexed_entries)
+            fail_count = len(failed_entries)
             if on_progress and (done == 1 or done % 5 == 0 or done == total):
-                on_progress(done, total, f"Indexing charts ({done}/{total})…")
-            elif done % 50 == 0:
-                print(f"  Indexed {done}/{total} files...")
+                on_progress(
+                    done,
+                    total,
+                    f"Indexing ({done}/{total}): {display_name}",
+                    indexed_ok=ok_count,
+                    indexed_failed=fail_count,
+                    current_file=display_name,
+                )
 
     indexed_entries.sort(key=lambda x: (x["scale"], x["file"]))
     failed_entries.sort(key=lambda x: x["file"])
 
-    print(f"Indexed {len(chart_index)} charts ({len(failed_entries)} failed)")
+    logger.info(
+        "Indexed %d charts (%d failed, %d skipped outside demo bounds)",
+        len(chart_index),
+        len(failed_entries),
+        len(skipped_bounds),
+    )
     refresh_s52_mariner_settings()
     if cache_path:
+        out_obj: dict = dict(chart_index)
+        if clip_bounds is not None:
+            out_obj["__index_meta__"] = {
+                "bounds_sig": _sample_index_bounds_sig(clip_bounds),
+                "disk_keys": sorted(file_keys),
+            }
         with open(cache_path, "w", encoding="utf-8") as f:
-            json.dump(chart_index, f)
+            json.dump(out_obj, f)
     _finalize_load_report(
         files_found,
         indexed_entries,
         failed_entries,
         from_cache=False,
         started_at=started_at,
+        skipped_bounds=skipped_bounds,
     )
     if on_progress:
         n = len(chart_index)
-        on_progress(n, n, f"Indexed {n} chart file(s)")
+        on_progress(
+            n,
+            n,
+            f"Indexed {n} chart file(s) ({len(failed_entries)} failed, {len(skipped_bounds)} skipped)",
+            indexed_ok=len(indexed_entries),
+            indexed_failed=len(failed_entries),
+        )
 
 
-def read_s57_layer(filepath: str, layer: str):
+def read_s57_layer(
+    filepath: str,
+    layer: str,
+    bbox: tuple[float, float, float, float] | None = None,
+):
     features = []
     try:
-        result = ogr_read(filepath, layer=layer)
+        read_kwargs: dict = {}
+        if bbox is not None:
+            read_kwargs["bbox"] = bbox
+        result = ogr_read(filepath, layer=layer, **read_kwargs)
         meta = result[0]
         geometries = result[2]
         field_arrays = result[3]
@@ -1170,7 +1861,7 @@ def read_s57_layer(filepath: str, layer: str):
             geom = parse_wkb(geom_wkb)
             if geom is None:
                 continue
-            geom = _normalize_line_geometry(geom)
+            geom = _normalize_line_geometry(geom, layer=layer)
 
             props = {"layer": layer}
             for attr_name, idx in keep_indices:
@@ -1203,10 +1894,22 @@ def read_s57_layer(filepath: str, layer: str):
 @app.on_event("startup")
 async def startup():
     """Load bundled sample charts on start (skip when SKIP_STARTUP_CHART_LOAD=1)."""
-    if os.environ.get("SKIP_STARTUP_CHART_LOAD", "").lower() in ("1", "true", "yes"):
+    logger.info("S-57 Web Viewer starting (log file: %s)", LOG_FILE)
+    if os.environ.get("S57_DIR"):
+        root = Path(os.environ["S57_DIR"]).resolve()
+        if root.is_dir() and _dir_has_charts(root):
+            _start_datasource_load(root, mode="replace")
         return
-    if DEFAULT_SAMPLE_DIR.is_dir() and find_chart_files(DEFAULT_SAMPLE_DIR):
-        _start_datasource_load(None, mode="default")
+    if _restore_persisted_datasource():
+        _start_datasource_load(chart_source_dirs[0], mode=datasource_mode)
+        return
+    if not DEFAULT_SAMPLE_DIR.is_dir() or not find_chart_files(DEFAULT_SAMPLE_DIR):
+        return
+    if os.environ.get("SKIP_STARTUP_CHART_LOAD", "").lower() in ("1", "true", "yes"):
+        _apply_chart_sources("default", DEFAULT_SAMPLE_DIR.resolve())
+        await asyncio.to_thread(build_chart_index)
+        return
+    _start_datasource_load(None, mode="default")
 
 
 @app.get("/api/datasource")
@@ -1319,20 +2022,29 @@ async def upload_datasource(
     upload_root.mkdir(parents=True, exist_ok=True)
     total = len(chart_files)
 
+    global _last_progress_log_key
     with _load_progress_lock:
         _load_progress["status"] = "running"
         _load_progress["error"] = None
         _load_progress["result"] = None
         _load_progress["percent"] = 0
+        _load_progress["files_found"] = total
+        _load_progress["indexed_ok"] = 0
+        _load_progress["indexed_failed"] = 0
+        _load_progress["current_file"] = ""
+    _last_progress_log_key = ""
 
     try:
         for i, uf in enumerate(chart_files, start=1):
+            safe_name = Path((uf.filename or "chart.000").replace("\\", "/").lstrip("/")).name
             _set_load_progress(
                 "upload",
                 i,
                 total,
-                f"Uploading chart files ({i}/{total})…",
+                f"Uploading ({i}/{total}): {safe_name}",
                 status="running",
+                files_found=total,
+                current_file=safe_name,
             )
             rel = Path((uf.filename or "chart.000").replace("\\", "/").lstrip("/"))
             safe_parts = [p for p in rel.parts if p not in ("..", "")]
@@ -1346,6 +2058,7 @@ async def upload_datasource(
         raise HTTPException(status_code=500, detail=f"Upload failed: {exc}") from exc
 
     load_mode = _normalize_load_mode(mode)
+    logger.info("Uploaded %d chart file(s) to %s (mode=%s)", total, upload_root, load_mode)
     _start_datasource_load(upload_root, mode=load_mode, already_running=True)
     return JSONResponse({
         "status": "started",
@@ -1392,7 +2105,11 @@ def _ensure_layer_features_bbox(features: list[dict]) -> bool:
     return True
 
 
-def _load_layer_features(chart_path: str, layer: str) -> list[dict]:
+def _load_layer_features(
+    chart_path: str,
+    layer: str,
+    vp: tuple[float, float, float, float] | None = None,
+) -> list[dict]:
     cache_key = hashlib.md5(f"{chart_path}:{layer}:v{LAYER_CACHE_VERSION}".encode()).hexdigest()
     cache_file = CACHE_DIR / f"{cache_key}.json"
     if cache_file.exists():
@@ -1405,9 +2122,13 @@ def _load_layer_features(chart_path: str, layer: str) -> list[dict]:
             except OSError:
                 pass
         return features
-    features = read_s57_layer(chart_path, layer)
-    with open(cache_file, "w", encoding="utf-8") as f:
-        json.dump(features, f)
+    features = read_s57_layer(chart_path, layer, bbox=vp)
+    if vp is None:
+        try:
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(features, f)
+        except OSError:
+            pass
     return features
 
 
@@ -1499,9 +2220,22 @@ def _feature_intersects_viewport(feature: dict, vp: tuple[float, float, float, f
     return _bbox_intersects(bbox[0], bbox[1], bbox[2], bbox[3], vp[0], vp[1], vp[2], vp[3])
 
 
+_LOW_ZOOM_SYMBOL_LAYERS = frozenset({
+    "LIGHTS", "FOGSIG",
+    "BCNCAR", "BCNISD", "BCNLAT", "BCNSAW", "BCNSPP", "RTPBCN", "TOPMAR",
+    "BOYCAR", "BOYISD", "BOYLAT", "BOYSAW", "BOYSPP",
+    "PILPNT", "PILBOP", "RDOSTA", "CTRPNT", "RDOCAL",
+    "LNDMRK", "LNDELV",
+})
+
+
 def _layers_skipped_at_zoom(zoom: int) -> set[str]:
     skip: set[str] = set()
-    if zoom <= 6:
+    if zoom <= 8:
+        skip.update(_LOW_ZOOM_SYMBOL_LAYERS)
+    if zoom <= 7:
+        skip.update({"OBSTRN", "UWTROC", "WRECKS", "SOUNDG"})
+    elif zoom <= 6:
         skip.add("SOUNDG")
     if zoom <= 5:
         skip.add("DEPCNT")
@@ -1570,7 +2304,7 @@ def _collect_chart_viewport_features(
             chart_name, chart, vp, zoom, requested_layers, skipped_layers, apply_scamin,
         )
     except Exception as exc:
-        print(f"Warning: viewport load failed for {chart_name}: {exc}")
+        logger.warning("Viewport load failed for %s: %s", chart_name, exc)
         return [], {
             "name": chart_name,
             "file": _chart_display_name(chart_name),
@@ -1589,7 +2323,7 @@ def _load_chart_layer_viewport(
     zoom: int,
     apply_scamin: bool,
 ) -> tuple[str, list[dict], int]:
-    layer_features = _load_layer_features(chart_path, layer)
+    layer_features = _load_layer_features(chart_path, layer, vp)
     raw_count = len(layer_features)
     filtered = _filter_features_for_viewport(
         layer_features, vp, layer, zoom,
@@ -1699,11 +2433,13 @@ def _build_charts_response(
             continue
         matching_charts.append((name, info))
 
-    matching_charts.sort(key=lambda item: item[1]["scale"])
+    primary_scale = _primary_scale_band_for_zoom(zoom)
+    matching_charts.sort(
+        key=lambda item: _chart_viewport_rank(item[1], west, south, east, north, primary_scale),
+    )
     charts_matched = len(matching_charts)
-
-    max_charts = 50
-    loaded_charts = matching_charts[:max_charts]
+    loaded_charts = matching_charts
+    max_charts = charts_matched
     vp = _padded_viewport(west, south, east, north)
     skipped_layers = _layers_skipped_at_zoom(zoom)
 
@@ -1745,8 +2481,6 @@ def _build_charts_response(
         for layer, count in by_layer.items():
             features_by_layer[layer] = features_by_layer.get(layer, 0) + count
         chart_details.append(detail)
-        if features_capped:
-            break
 
     layer_breakdown = [
         {"layer": layer, "features": count}
@@ -1759,7 +2493,7 @@ def _build_charts_response(
         "meta": {
             "charts_loaded": len(chart_details),
             "charts_matched": charts_matched,
-            "charts_capped": charts_matched > max_charts,
+            "charts_capped": False,
             "max_charts": max_charts,
             "total_features": len(all_features),
             "raw_features_before_viewport": raw_feature_count,
@@ -1794,7 +2528,7 @@ async def get_charts(
     if cache_file.exists():
         try:
             return FileResponse(cache_file, media_type="application/json")
-        except OSError:
+        except (OSError, FileNotFoundError):
             pass
 
     try:
@@ -1802,7 +2536,7 @@ async def get_charts(
             _build_charts_response, west, south, east, north, zoom, layers, apply_scamin,
         )
     except Exception as exc:
-        print(f"Error building charts response: {exc}")
+        logger.error("Error building charts response: %s", exc)
         raise HTTPException(status_code=500, detail=f"Chart load failed: {exc}") from exc
 
     tmp_file = cache_file.with_suffix(".json.tmp")
@@ -1852,6 +2586,12 @@ async def get_single_chart(chart_name: str, layers: str = Query("")):
     })
 
 
+@app.get("/health")
+async def health():
+    """Lightweight probe for Render / load balancers (no GDAL work)."""
+    return {"ok": True}
+
+
 @app.get("/api/categories")
 async def get_categories():
     return JSONResponse(DISPLAY_CATEGORIES)
@@ -1893,6 +2633,57 @@ def record_visit() -> dict:
 @app.get("/api/visitors")
 async def get_visitors():
     return JSONResponse(record_visit())
+
+
+@app.get("/api/admin/logs")
+async def get_admin_logs(
+    request: Request,
+    lines: int = Query(500, ge=1, le=5000),
+    level: str | None = Query(None),
+):
+    _require_admin_access(request)
+    entries = _collect_log_entries(max_lines=lines, level=level)
+    file_size = LOG_FILE.stat().st_size if LOG_FILE.is_file() else 0
+    with _log_buf_lock:
+        buffer_count = len(_log_records)
+    return JSONResponse({
+        "entries": entries,
+        "count": len(entries),
+        "buffer_count": buffer_count,
+        "file": str(LOG_FILE),
+        "file_size": file_size,
+    })
+
+
+@app.delete("/api/admin/logs")
+async def clear_admin_logs(request: Request):
+    _require_admin_access(request)
+    with _log_buf_lock:
+        _log_records.clear()
+    if LOG_FILE.is_file():
+        try:
+            LOG_FILE.write_text("", encoding="utf-8")
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Could not clear log file: {exc}") from exc
+    logger.info("Admin cleared application log")
+    return JSONResponse({"cleared": True})
+
+
+@app.get("/api/admin/status")
+async def get_admin_status(request: Request):
+    _require_admin_access(request)
+    file_size = LOG_FILE.stat().st_size if LOG_FILE.is_file() else 0
+    with _log_buf_lock:
+        buffer_count = len(_log_records)
+    return JSONResponse({
+        "log_file": str(LOG_FILE),
+        "file_size": file_size,
+        "buffer_count": buffer_count,
+        "chart_count": len(chart_index),
+        "datasource_mode": datasource_mode,
+        "datasource_paths": [str(p) for p in chart_source_dirs],
+        "load_progress": _progress_snapshot(),
+    })
 
 
 _static = Path(__file__).parent / "static"
@@ -1945,11 +2736,29 @@ if __name__ == "__main__":
     start_port = int(os.environ.get("PORT", "8080"))
     port = _find_available_port(start_port, host)
     if port != start_port:
-        print(f"Port {start_port} is in use; using port {port}", flush=True)
-    print(f"Open http://{host}:{port}", flush=True)
+        logger.warning("포트 %s 사용 중 — %s 포트로 시작합니다", start_port, port)
+    logger.info("브라우저에서 열기: http://%s:%s", host, port)
 
     reload = os.environ.get("RELOAD", "1").lower() not in ("0", "false", "no")
+    uvicorn_kwargs = {
+        "host": host,
+        "port": port,
+        "access_log": False,
+        "log_config": _uvicorn_log_config(),
+    }
     if reload:
-        uvicorn.run("server:app", host=host, port=port, reload=True)
+        reload_excludes = [
+            "cache/*",
+            "cache/**",
+            "sample_data/**",
+            "public/**",
+            "*.json",
+        ]
+        uvicorn.run(
+            "server:app",
+            reload=True,
+            reload_excludes=reload_excludes,
+            **uvicorn_kwargs,
+        )
     else:
-        uvicorn.run(app, host=host, port=port)
+        uvicorn.run(app, **uvicorn_kwargs)

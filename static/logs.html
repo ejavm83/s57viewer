@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>S-57 Viewer - Admin Logs</title>
+    <script>try{if(sessionStorage.getItem('s57viewer-admin-mode')==='1')document.documentElement.classList.add('admin-mode');}catch(e){}</script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --bg: #0d1117; --bg-card: #161b22; --bg-code: #0d1117;
+            --border: #30363d; --text: #e6edf3; --text-muted: #8b949e;
+            --accent: #FFB300; --green: #3fb950; --red: #f85149;
+            --orange: #d29922; --blue: #58a6ff;
+        }
+        body { font-family: 'Segoe UI', -apple-system, 'Malgun Gothic', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+        .top-nav { position: sticky; top: 0; z-index: 100; background: rgba(13,17,23,.95); backdrop-filter: blur(12px); border-bottom: 1px solid var(--border); padding: 0 24px; height: 56px; display: flex; align-items: center; justify-content: space-between; }
+        .top-nav .logo { display: flex; align-items: center; gap: 12px; text-decoration: none; color: var(--text); }
+        .top-nav .logo span { font-size: 18px; font-weight: 700; }
+        .top-nav .nav-links { display: flex; gap: 12px; align-items: center; }
+        .top-nav .nav-links a, .top-nav .nav-links .nav-admin-toggle { color: var(--text-muted); text-decoration: none; font-size: 14px; padding: 6px 12px; border-radius: 6px; border: none; background: transparent; font-family: inherit; cursor: pointer; }
+        .top-nav .nav-links a:hover, .top-nav .nav-links .nav-admin-toggle:hover { color: var(--text); background: rgba(255,255,255,.05); }
+        .top-nav .nav-links a.active, .top-nav .nav-links .nav-admin-toggle[aria-pressed="true"] { color: var(--accent); background: rgba(255,179,0,.1); }
+        html:not(.admin-mode) .top-nav .nav-links a.admin-only { display: none; }
+        .page { max-width: 1400px; margin: 0 auto; padding: 20px 24px 40px; }
+        .page h1 { font-size: 22px; margin-bottom: 6px; }
+        .page .subtitle { color: var(--text-muted); font-size: 14px; margin-bottom: 20px; }
+        .admin-gate { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 32px; text-align: center; max-width: 480px; margin: 48px auto; }
+        .admin-gate h2 { font-size: 18px; margin-bottom: 12px; }
+        .admin-gate p { color: var(--text-muted); font-size: 14px; line-height: 1.6; }
+        .admin-gate kbd { display: inline-block; padding: 2px 8px; background: var(--bg-code); border: 1px solid var(--border); border-radius: 4px; font-size: 13px; }
+        html.admin-mode .admin-gate { display: none; }
+        html:not(.admin-mode) .logs-workspace { display: none; }
+        .status-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; margin-bottom: 16px; }
+        .status-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+        .status-card .label { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-muted); margin-bottom: 4px; }
+        .status-card .value { font-size: 14px; font-weight: 600; word-break: break-all; }
+        .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; padding: 12px 14px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; }
+        .toolbar label { font-size: 13px; color: var(--text-muted); display: flex; align-items: center; gap: 6px; }
+        .toolbar select, .toolbar input[type="search"] { background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 6px 10px; font-size: 13px; }
+        .toolbar input[type="search"] { min-width: 200px; }
+        .toolbar button { background: rgba(255,255,255,.06); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 6px 14px; font-size: 13px; cursor: pointer; }
+        .toolbar button:hover { background: rgba(255,255,255,.1); }
+        .toolbar button.primary { background: rgba(255,179,0,.15); border-color: rgba(255,179,0,.4); color: var(--accent); }
+        .toolbar button.danger { border-color: rgba(248,81,73,.5); color: var(--red); }
+        .log-panel { background: var(--bg-code); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+        .log-meta { padding: 8px 14px; font-size: 12px; color: var(--text-muted); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+        .log-output { font-family: 'Cascadia Code', Consolas, monospace; font-size: 12px; line-height: 1.55; max-height: calc(100vh - 320px); min-height: 400px; overflow: auto; padding: 8px 0; }
+        .log-line { display: flex; gap: 10px; padding: 2px 14px; border-left: 3px solid transparent; }
+        .log-line:hover { background: rgba(255,255,255,.03); }
+        .log-line.level-WARNING { border-left-color: var(--orange); }
+        .log-line.level-ERROR, .log-line.level-CRITICAL { border-left-color: var(--red); background: rgba(248,81,73,.06); }
+        .log-time { color: var(--text-muted); flex-shrink: 0; width: 140px; }
+        .log-level { flex-shrink: 0; width: 64px; font-weight: 600; font-size: 11px; }
+        .log-level.level-INFO { color: var(--green); }
+        .log-level.level-WARNING { color: var(--orange); }
+        .log-level.level-ERROR, .log-level.level-CRITICAL { color: var(--red); }
+        .log-level.level-DEBUG { color: var(--blue); }
+        .log-msg { flex: 1; white-space: pre-wrap; word-break: break-word; }
+        .log-empty { padding: 48px; text-align: center; color: var(--text-muted); }
+        .log-error-banner { margin-bottom: 12px; padding: 10px 14px; background: rgba(248,81,73,.12); border: 1px solid rgba(248,81,73,.4); border-radius: 8px; color: var(--red); font-size: 13px; display: none; }
+        .log-error-banner.visible { display: block; }
+    </style>
+</head>
+<body>
+<nav class="top-nav">
+    <a href="/" class="logo">
+        <svg viewBox="0 0 40 40" width="32" height="32" aria-hidden="true"><circle cx="20" cy="20" r="18" fill="none" stroke="#FFB300" stroke-width="2"/><circle cx="20" cy="20" r="3" fill="#FFB300"/></svg>
+        <span>S-57 Web Viewer</span>
+    </a>
+    <div class="nav-links">
+        <a href="/">Viewer</a>
+        <button type="button" id="admin-mode-toggle" class="nav-admin-toggle" aria-pressed="false" title="Admin (Shift+F12)">Admin</button>
+        <a href="/docs.html" class="admin-only">Documentation</a>
+        <a href="/report.html">Analysis</a>
+        <a href="/logs.html" class="active admin-only">Logs</a>
+        <a href="https://docs.google.com/document/d/1duEzdO5jr04jgnnGRqFvlzImcVOBb6LAvQ2Fp5ufr_Q/edit?usp=sharing" target="_blank" rel="noopener noreferrer" class="admin-only">Feedback</a>
+    </div>
+</nav>
+<div class="page">
+    <h1>&#49436;&#48260; &#47196;&#44536;</h1>
+    <p class="subtitle">&#44288;&#47532;&#51088; &#51204;&#50857; &mdash; API &#50836;&#52397;, &#52264;&#53944; &#51064;&#45937;&#49905;, &#50724;&#47448; &#46321;&#51012; &#49892;&#49884;&#44036;&#51004;&#47196; &#54869;&#51064;&#54633;&#45768;&#45796;.</p>
+    <div class="admin-gate" id="admin-gate">
+        <h2>&#44288;&#47532;&#51088; &#47784;&#46300;&#44032; &#54596;&#50836;&#54633;&#45768;&#45796;</h2>
+        <p>&#51060; &#54168;&#51060;&#51648;&#45716; &#44288;&#47532;&#51088; &#47784;&#46300;&#50640;&#49436;&#47564; &#49324;&#50857;&#54624; &#49688; &#51080;&#49845;&#45768;&#45796;.<br>
+        <kbd>Shift</kbd> + <kbd>F12</kbd> &#46608;&#45716; &#49345;&#45800; <strong>Admin</strong> &#48260;&#53948;&#51012; &#53364;&#47533;&#54616;&#49464;&#50836;.</p>
+    </div>
+    <div class="logs-workspace" id="logs-workspace">
+        <div id="log-error-banner" class="log-error-banner" role="alert"></div>
+        <div class="status-grid" id="status-grid" aria-live="polite"></div>
+        <div class="toolbar">
+            <label>&#47112;&#48296; <select id="filter-level"><option value="">&#51204;&#52404;</option><option value="DEBUG">DEBUG</option><option value="INFO" selected>INFO+</option><option value="WARNING">WARNING+</option><option value="ERROR">ERROR</option></select></label>
+            <label>&#44160;&#49353; <input type="search" id="filter-search" placeholder="&#47700;&#49884;&#51648; &#54596;&#53552;" autocomplete="off"></label>
+            <label><input type="checkbox" id="auto-refresh" checked> &#51088;&#46041; &#49352;&#47196;&#44256;&#52840; (2&#52488;)</label>
+            <label><input type="checkbox" id="auto-scroll" checked> &#51088;&#46041; &#49828;&#53356;&#47204;</label>
+            <button type="button" id="btn-refresh" class="primary">&#49352;&#47196;&#44256;&#52840;</button>
+            <button type="button" id="btn-copy">&#48373;&#49324;</button>
+            <button type="button" id="btn-clear" class="danger">&#47196;&#44536; &#51648;&#50892;&#44592;</button>
+        </div>
+        <div class="log-panel">
+            <div class="log-meta"><span id="log-meta-left">&mdash;</span><span id="log-meta-right"></span></div>
+            <div id="log-output" class="log-output" role="log"><div class="log-empty">&#47196;&#44536;&#47484; &#48512;&#47484;&#50752; &#51473;&#51077;&#45768;&#45796;&hellip;</div></div>
+        </div>
+    </div>
+</div>
+<script src="admin-mode.js"></script>
+<script src="logs.js"></script>
+</body>
+</html>

@@ -27,9 +27,11 @@ CATEGORIES = {
     "wreck": ["WRECKS"],
     "land": ["LNDARE", "LNDMRK", "LNDELV", "LNDRGN", "LAKARE", "BUAARE", "RIVERS", "CANALS"],
     "coastline": ["COALNE", "SLCONS"],
+    "traffic": [
+        "RESARE", "TSSBND", "TSELNE", "ISTZNE", "TSSLPT", "TSSRON", "ACHBRT", "ACHARE",
+    ],
     "navigation": [
-        "DWRTPT", "TWRTPT", "FAIRWY", "FERYRT", "RDOCAL", "RDOSTA", "ACHBRT", "ACHARE",
-        "CTRPNT", "PILPNT", "PILBOP", "RESARE", "TSSBND", "TSELNE", "ISTZNE", "TSSLPT", "TSSRON",
+        "DWRTPT", "TWRTPT", "FAIRWY", "FERYRT", "RDOCAL", "RDOSTA", "CTRPNT", "PILPNT", "PILBOP",
     ],
     "infrastructure": ["BRIDGE", "CBLOHD", "CBLSUB", "PIPSOL", "MORFAC", "DAMCON", "PONTON", "HULKES", "PYLONS"],
     "coverage": ["M_COVR", "M_QUAL"],

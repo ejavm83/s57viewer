@@ -22,6 +22,7 @@
             if (on) sessionStorage.setItem(STORAGE_KEY, '1');
             else sessionStorage.removeItem(STORAGE_KEY);
         } catch (_) { /* private browsing */ }
+        document.dispatchEvent(new CustomEvent('admin-mode-changed', { detail: { enabled: on } }));
     }
 
     function toggleAdminMode() {

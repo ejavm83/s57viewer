@@ -3,7 +3,7 @@
     {
       "id": "korea-regional",
       "name": "Korea — peninsula overview (demo)",
-      "description": "33 ENC cells (bands 1–2): Yellow Sea, south coast, East Sea. Matches regional demo extent; not for navigation.",
+      "description": "ENC bands 1–2 (Yellow Sea / peninsula / East Sea). The server indexes only cells overlapping the built-in Korea demo WGS84 clip (see README); remaining .000 on disk are skipped for faster startup. Not for navigation.",
       "region": "KR"
     }
   ]

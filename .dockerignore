@@ -9,3 +9,5 @@ DOCUMENTATION.md
 README.md
 # Full ENC bundle (~350MB) — use sample_data/korea-regional in cloud images
 public/sample/
+# Build-time OpenCPN assets (runtime uses static/s52-*.json and static/s57data/*.png)
+public/s57data/

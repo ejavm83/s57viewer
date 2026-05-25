@@ -6,11 +6,16 @@ services:
     name: s57viewer
     runtime: docker
     plan: free
-    healthCheckPath: /api/categories
+    healthCheckPath: /health
     envVars:
       - key: CACHE_DIR
-        value: /tmp/cache
+        value: /app/cache
       - key: DEFAULT_SAMPLE_DIR
         value: /app/sample_data/korea-regional
+      - key: SKIP_STARTUP_CHART_LOAD
+        value: "1"
+      # Optional: index every .000 under DEFAULT_SAMPLE_DIR (slower / more memory)
+      # - key: DEFAULT_SAMPLE_INDEX_BOUNDS
+      #   value: "all"
       - key: PYTHONUNBUFFERED
         value: "1"

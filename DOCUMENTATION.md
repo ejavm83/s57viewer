@@ -22,6 +22,7 @@ S-57 파일은 일반적인 이미지 파일이 아니라 **바이너리 형식�
 
 - **데이터 형식**: IHO S-57 ENC (`.000` 확장자)
 - **로드 방식**: 뷰어 시작 후 사이드바에서 S-57 폴더 선택(서버 폴더 탐색 또는 브라우저 업로드), 또는 환경 변수 `S57_DIR`로 기본 경로 지정
+- **번들 기본 샘플** (`sample_data/korea-regional` 등): 디스크에 여러 `.000`이 있어도, 데모 속도를 위해 **한반도 시연용 WGS84 경계 상자와 겹치는 셀만** 서버 인덱스에 올립니다. 폴더 전체를 인덱스하려면 `DEFAULT_SAMPLE_INDEX_BOUNDS=all`, 박스를 바꾸려면 `DEFAULT_SAMPLE_INDEX_BOUNDS=서경,남위,동경,북위`(쉼표 구분)를 설정합니다.
 - **예시 데이터**: 대한민국 국립해양조사원 발행 전자해도 (2024-06-21, NTM-25) — 약 744개 파일, 제주·독도·이어도 포함
 - **폴더 분석**: 로드 완료 후 파일 수·축척 분포·레이어 요약이 사이드바에 표시되며, `GET /api/datasource/report`로 상세 결과 조회 가능
 
@@ -68,7 +69,7 @@ s57viewer/
 ├── public/
 │   └── PresLib_e4.0.0.dai     ← IHO S-52 Presentation Library 원본
 ├── scripts/
-│   └── build_preslib.py       ← DAI → s52-preslib.json 변환 스크립트
+│   ├── sync_opencpn_s57data.py  ← OpenCPN 설치 폴더 s57data → public/static 복사
 ├── static/
 │   ├── index.html             ← 뷰어 UI
 │   ├── docs.html              ← 웹 문서 (이 설명서의 HTML 버전)
@@ -249,7 +250,8 @@ S-57 파일 (.000)
 | **Sounding** | 청록 | 수심 측량값 | 숫자로 표시되는 바다 깊이 |
 | **Depth Area** | 파랑 | 수심 구역, 등심선, 해저 바닥 | 색으로 구분되는 수심 영역 |
 | **Coastline** | 회색 | 해안선, 호안(해안 구조물) | 바다와 육지의 경계선 |
-| **Navigation** | 주황 | 심수 항로, 양방향 항로, 여객선 항로, 정박지, 통제점 | 선박이 다니는 길 관련 |
+| **Navigation** | 주황 | 심수·양방향 항로, 항로(페어웨이), 여객선 항로, 무선 통제점·통제소 등 | 일반 항로·통제점 (TSS·제한구역 제외) |
+| **TSS / 제한구역 / 정박지** | 자홍·연보라 (S-52 `CHMGD`/`TRFC*`) | 분리 항로(TSS) 경계·차선, 근해 교통 구역, 제한 구역, 정박지 | **기본 꺼짐** — 소축척에서 선이 겹쳐 지저분해 보일 때 끄거나 필요 시만 켭니다. |
 | **Infrastructure** | 갈색 | 교량, 가공케이블, 해저케이블, 해저파이프라인, 계선시설, 댐, 부잔교, 교각 | 인공 구조물 |
 
 #### Chart Info (해도 정보)
@@ -352,16 +354,32 @@ S-57 파일 (.000)
 
 ### 4.6 IHO S-52 Presentation Library (PresLib e4.0.0)
 
-지도 심볼·색상은 **IHO S-52 Presentation Library Edition 4.0.0** (`public/PresLib_e4.0.0.dai`)를 기준으로 합니다.
+지도 심볼·색상·조회 규칙은 **OpenCPN에 포함된 `chartsymbols.xml`**(IHO S-52 Presentation Library 표현)을 `scripts/build_preslib.py`로 파싱한 `static/s52-preslib.json`에서 읽습니다. OpenCPN과 동일한 번들을 쓰려면 아래 **OpenCPN `s57data`와 동기화**를 참고하세요. (저장소의 `public/PresLib_e4.0.0.dai`는 IHO 원본 참고용이며, 웹 뷰어 빌드의 직접 입력은 `chartsymbols.xml`입니다.)
 
-#### DAI 파싱 결과 (`scripts/build_preslib.py` → `static/s52-preslib.json`)
+#### PresLib JSON (`scripts/build_preslib.py` → `static/s52-preslib.json`)
 
 | 항목 | 내용 |
 |------|------|
-| 버전 / 팔레트 | 4.0.0, **DAY** |
-| 색상 토큰 | **67개** (`COLS` + `CCIE` xyY → sRGB 변환) |
-| 객체 클래스 | **151개** S-57 객체 |
-| LUPT 조회 규칙 | **1,164개** (객체·기하·속성 조건 + `INST` 명령) |
+| 버전 / 팔레트 | OpenCPN 번들, **DAY_BRIGHT** 등 5종 |
+| 색상 토큰 | `chartsymbols.xml`의 color-table (팔레트별) |
+| 객체 클래스 | **259개** S-57 객체 (lookup 그룹) |
+| LUPT 조회 규칙 | **3,052개** (객체·기하·속성 조건 + `INST` 명령; OpenCPN `chartsymbols.xml` 기준) |
+
+#### OpenCPN `s57data`와 동기화
+
+실제 표시는 **OpenCPN이 설치 디렉터리에 넣는 IHO S-52 번들**(`chartsymbols.xml`, `rastersymbols-*.png`, 보조 CSV·`S52RAZDS.RLE` 등)과 맞추는 것이 OpenCPN 화면과 가장 유사합니다.
+
+1. Windows 기본 설치 경로: `C:\Program Files (x86)\OpenCPN\s57data\`
+2. 저장소로 복사 후 PresLib 재생성:
+
+```bash
+python scripts/sync_opencpn_s57data.py
+python scripts/build_preslib.py
+```
+
+`build_preslib.py`는 `chartsymbols.xml`을 다음 순서로 찾습니다: 환경 변수 `OPENCPN_S57DATA`(폴더) 또는 `S52_CHARTSYMBOLS_XML`(파일) → 위와 같은 기본 설치 경로 → `public/s57data` → `static/s57data`.
+
+> **라이선스**: OpenCPN은 GPLv2입니다. `s57data`를 앱과 함께 재배포할 때는 해당 라이선스를 확인하세요.
 
 #### 렌더링 파이프라인
 

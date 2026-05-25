@@ -14,15 +14,39 @@ The output bundles everything the JS renderer needs to honour the standard:
 from __future__ import annotations
 
 import json
+import os
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-XML_SOURCES = [
-    ROOT / "public" / "s57data" / "chartsymbols.xml",
-    ROOT / "static" / "s57data" / "chartsymbols.xml",
-]
+
+
+def chartsymbols_xml_candidates() -> list[Path]:
+    """Prefer a local OpenCPN install (same bundle the desktop app uses), then repo copies."""
+    cands: list[Path] = []
+    env_dir = (os.environ.get("OPENCPN_S57DATA") or "").strip()
+    if env_dir:
+        cands.append(Path(env_dir) / "chartsymbols.xml")
+    env_xml = (os.environ.get("S52_CHARTSYMBOLS_XML") or "").strip()
+    if env_xml:
+        cands.append(Path(env_xml))
+    # Default Windows install locations (OpenCPN 5.x)
+    cands.append(Path(r"C:\Program Files (x86)\OpenCPN\s57data\chartsymbols.xml"))
+    cands.append(Path(r"C:\Program Files\OpenCPN\s57data\chartsymbols.xml"))
+    cands.append(ROOT / "public" / "s57data" / "chartsymbols.xml")
+    cands.append(ROOT / "static" / "s57data" / "chartsymbols.xml")
+    seen: set[str] = set()
+    out: list[Path] = []
+    for p in cands:
+        key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
 PRESLIB_OUT = ROOT / "static" / "s52-preslib.json"
 SYMBOL_ATLAS_OUT = ROOT / "static" / "s52-symbols.json"
 
@@ -40,11 +64,14 @@ KEEP_TABLES = {"Plain", "Symbolized", "Simplified", "Lines", "Paper"}
 
 
 def find_source() -> Path:
-    for path in XML_SOURCES:
+    cands = chartsymbols_xml_candidates()
+    for path in cands:
         if path.is_file():
             return path
     raise SystemExit(
-        f"chartsymbols.xml not found; checked: {', '.join(str(p) for p in XML_SOURCES)}"
+        "chartsymbols.xml not found; set OPENCPN_S57DATA to the OpenCPN "
+        f"'s57data' folder or place the file under public/static s57data. Checked:\n  "
+        + "\n  ".join(str(p) for p in cands)
     )
 
 
@@ -242,6 +269,14 @@ def build_symbol_atlas(symbols: dict) -> dict:
     return out
 
 
+def _source_label(src: Path) -> str:
+    """Path under the repo (relative) or absolute if outside (e.g. OpenCPN install)."""
+    try:
+        return str(src.resolve().relative_to(ROOT.resolve())).replace("\\", "/")
+    except ValueError:
+        return str(src.resolve()).replace("\\", "/")
+
+
 def main() -> None:
     src = find_source()
     tree = ET.parse(src)
@@ -255,7 +290,7 @@ def main() -> None:
 
     bundle = {
         "version": "OpenCPN-S52-PresLib",
-        "source": str(src.relative_to(ROOT)).replace("\\", "/"),
+        "source": _source_label(src),
         "palettes": palettes,
         "palette_sprites": PALETTE_FILES,
         "default_palette": "DAY_BRIGHT",
@@ -267,7 +302,7 @@ def main() -> None:
 
     PRESLIB_OUT.write_text(json.dumps(bundle, separators=(",", ":")), encoding="utf-8")
     atlas = {
-        "source": str(src.relative_to(ROOT)).replace("\\", "/"),
+        "source": _source_label(src),
         "sprite": PALETTE_FILES["DAY_BRIGHT"],
         "sprites": PALETTE_FILES,
         "count": len(atlas_entries := build_symbol_atlas(symbols)),

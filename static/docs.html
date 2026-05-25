@@ -471,6 +471,7 @@
         <a href="/">Viewer</a>
         <button type="button" id="admin-mode-toggle" class="nav-admin-toggle" aria-pressed="false" title="Toggle admin features (Shift+F12)">Admin</button>
         <a href="/docs.html" class="active admin-only">Documentation</a>
+        <a href="/logs.html" class="admin-only">Logs</a>
         <a href="https://docs.google.com/document/d/1duEzdO5jr04jgnnGRqFvlzImcVOBb6LAvQ2Fp5ufr_Q/edit?usp=sharing" target="_blank" rel="noopener noreferrer" class="admin-only">Feedback</a>
     </div>
 </nav>
@@ -504,7 +505,8 @@
             <li class="sub"><a href="#layer-depth">Depth</a></li>
             <li class="sub"><a href="#layer-navaid">Nav Aids</a></li>
             <li class="sub"><a href="#layer-hazard">Hazards</a></li>
-            <li class="sub"><a href="#layer-traffic">Traffic</a></li>
+            <li class="sub"><a href="#layer-traffic">TSS / zones</a></li>
+            <li class="sub"><a href="#layer-navigation">Routes</a></li>
             <li class="sub"><a href="#layer-infra">Infrastructure</a></li>
             <li><a href="#howto">6. How To Run</a></li>
             <li><a href="#performance">7. Performance</a></li>
@@ -530,7 +532,7 @@
             </div>
             <div class="card">
                 <h4><span class="badge badge-yellow">Version</span></h4>
-                <p>v0.0.3</p>
+                <p>v0.0.4</p>
             </div>
             <div class="card">
                 <h4><span class="badge badge-purple">Release</span></h4>
@@ -556,7 +558,7 @@
         <p>S-57 files are <strong>structured binary data</strong>, not ordinary images. This project converts S-57 data so it can be viewed in a standard web browser.</p>
 
         <h3 id="data-source">Data Source</h3>
-        <p>Select a folder containing S-57 <code>.000</code> files in the viewer sidebar (server browse or browser upload), or set <code>S57_DIR</code>. After indexing, <strong>Folder analysis</strong> appears in the sidebar; use <code>GET /api/datasource/report</code> for full details.</p>
+        <p>Select a folder containing S-57 <code>.000</code> files in the viewer sidebar (server browse or browser upload), or set <code>S57_DIR</code>. After indexing, open <strong><a href="/report.html">Analysis</a></strong> (header link or sidebar shortcut) for the full per-file report; the API is <code>GET /api/datasource/report</code>.</p>
         <div class="card-grid">
             <div class="card">
                 <h4><span class="badge badge-blue">Format</span></h4>
@@ -606,12 +608,14 @@
         <h3 id="file-structure">File structure</h3>
         <pre>s57viewer/
 ├── server.py
-├── public/PresLib_e4.0.0.dai     &larr; IHO S-52 Presentation Library source
-├── scripts/build_preslib.py      &larr; DAI &rarr; s52-preslib.json
+├── public/PresLib_e4.0.0.dai     &larr; IHO PresLib reference (DAI)
+├── public/s57data/             &larr; OpenCPN-style chartsymbols.xml + rasters (synced)
+├── scripts/build_preslib.py      &larr; chartsymbols.xml &rarr; s52-preslib.json
+├── scripts/sync_opencpn_s57data.py &larr; copy OpenCPN install s57data &rarr; public/static
 ├── static/
 │   ├── index.html, docs.html, style.css, app.js
 │   ├── s52-preslib.js            &larr; S-52 renderer (LUPT + CS)
-│   └── s52-preslib.json          &larr; parsed PresLib (67 colors, 1164 rules)
+│   └── s52-preslib.json          &larr; parsed PresLib (&sim;3052 lookup rules, OpenCPN bundle)
 ├── cache/                        &larr; chart index + GeoJSON cache
 ├── README.md, DOCUMENTATION.md</pre>
 
@@ -732,7 +736,8 @@
                 <tr><td><strong>Sounding</strong></td><td style="color:#00BCD4">&#9679;</td><td>Soundings</td><td>Depth values as numbers</td></tr>
                 <tr><td><strong>Depth Area</strong></td><td style="color:#3F51B5">&#9679;</td><td>Depth areas, contours</td><td>Depth areas by color</td></tr>
                 <tr><td><strong>Coastline</strong></td><td style="color:#607D8B">&#9679;</td><td>Coastline, shoreline structures</td><td>Sea&ndash;land boundary</td></tr>
-                <tr><td><strong>Navigation</strong></td><td style="color:#FF9800">&#9679;</td><td>Routes, anchorages, control points</td><td>Traffic-related features</td></tr>
+                <tr><td><strong>Navigation</strong></td><td style="color:#FF9800">&#9679;</td><td>Deep/two-way routes, fairways, ferries, radio points, control points</td><td>General route features (excludes TSS polygons/lines)</td></tr>
+                <tr><td><strong>TSS / 제한구역 / 정박지</strong></td><td style="color:#E040FB">&#9679;</td><td>TSS boundaries/lanes, inshore traffic zones, restricted areas, anchorages</td><td><strong>Off by default</strong> — S-52 magenta/purple; dense at small scale</td></tr>
                 <tr><td><strong>Infrastructure</strong></td><td style="color:#795548">&#9679;</td><td>Bridges, cables, pipelines, dams</td><td>Man-made structures</td></tr>
             </tbody>
         </table>
@@ -753,20 +758,21 @@
             <strong>Auto load:</strong> Panning or zooming triggers a new data request after 400 ms. "Loading charts..." is shown while loading.
         </div>
 
-        <h3 id="s52-preslib">IHO S-52 Presentation Library (PresLib e4.0.0)</h3>
-        <p>Map colours and symbols follow <code>public/PresLib_e4.0.0.dai</code>, parsed by <code>scripts/build_preslib.py</code> into <code>static/s52-preslib.json</code> and applied at runtime by <code>s52-preslib.js</code>.</p>
+        <h3 id="s52-preslib">IHO S-52 Presentation Library (OpenCPN chartsymbols)</h3>
+        <p>Map colours and symbols are driven by OpenCPN&rsquo;s bundled <code>chartsymbols.xml</code> (parsed by <code>scripts/build_preslib.py</code> into <code>static/s52-preslib.json</code> and applied at runtime by <code>s52-preslib.js</code>). The IHO <code>public/PresLib_e4.0.0.dai</code> file remains a human-readable reference; the build input is <code>chartsymbols.xml</code>.</p>
+        <p><strong>Stay in sync with OpenCPN:</strong> <code>python scripts/sync_opencpn_s57data.py</code> then <code>python scripts/build_preslib.py</code>. Set <code>OPENCPN_S57DATA</code> if your install path differs.</p>
         <table>
             <thead><tr><th>Item</th><th>Value</th></tr></thead>
             <tbody>
-                <tr><td>Version / palette</td><td>4.0.0, <strong>DAY</strong></td></tr>
-                <tr><td>Colour tokens</td><td><strong>67</strong> (CCIE xyY &rarr; sRGB)</td></tr>
-                <tr><td>Object classes</td><td><strong>151</strong> S-57 objects</td></tr>
-                <tr><td>LUPT lookup rules</td><td><strong>1,164</strong> (geometry + attribute + INST)</td></tr>
+                <tr><td>Bundle</td><td>OpenCPN <code>s57data</code> / IHO S-52 tables</td></tr>
+                <tr><td>Colour tokens</td><td>Per palette in <code>chartsymbols.xml</code> color-tables</td></tr>
+                <tr><td>Object classes (lookup groups)</td><td><strong>259</strong></td></tr>
+                <tr><td>LUPT lookup rules</td><td><strong>3,052</strong> (geometry + attribute + INST)</td></tr>
             </tbody>
         </table>
         <p>Each feature is matched to a LUPT rule; instructions (<code>AC</code>, <code>LS</code>, <code>SY</code>, <code>CS</code>) become OpenLayers styles. Conditional symbology includes <code>DEPARE03</code>, <code>DEPCNT03</code>, <code>SOUNDG03</code>, <code>LIGHTS06</code>, <code>OBSTRN07</code>, and <code>WRECKS05</code>.</p>
         <div class="alert alert-tip">
-            <strong>Regenerate JSON:</strong> <code>python scripts/build_preslib.py</code>
+            <strong>Regenerate JSON:</strong> <code>python scripts/build_preslib.py</code> (after <code>sync_opencpn_s57data.py</code> on a new OpenCPN version)
         </div>
 
         <h3 id="depth-colors">Depth colour scheme (DEPARE03)</h3>
@@ -782,7 +788,7 @@
         <table>
             <thead><tr><th>Order</th><th>Layers</th><th>Description</th></tr></thead>
             <tbody>
-                <tr><td>1 (bottom)</td><td>Unsurveyed &rarr; sea area &rarr; depth areas &rarr; lakes &rarr; land</td><td>Polygon features</td></tr>
+                <tr><td>1 (bottom)</td><td>Unsurveyed &rarr; sea area &rarr; depth areas &rarr; land (LNDARE) &rarr; lakes / rivers / canals (LAKARE, RIVERS, CANALS)</td><td>Polygon features (inland water is painted above generalized land so lakes are not covered)</td></tr>
                 <tr><td>2</td><td>Contours &rarr; coastline &rarr; shoreline works</td><td>Line features</td></tr>
                 <tr><td>3</td><td>Anchorages &rarr; routes &rarr; cables &rarr; pipelines</td><td>Traffic areas and facilities</td></tr>
                 <tr><td>4</td><td>Bridges &rarr; dams &rarr; pontoons &rarr; moorings</td><td>Man-made structures</td></tr>
@@ -861,16 +867,35 @@
             </tbody>
         </table>
 
-        <h3 id="layer-traffic">Traffic layers</h3>
+        <h3 id="layer-traffic">TSS, restricted areas, anchorages (Display Option: «TSS / 제한구역 / 정박지»)</h3>
+        <p>These ENC layers use S-52 <strong>magenta / light purple</strong> line colours (<code>CHMGD</code>, <code>TRFCD</code>, <code>TRFCF</code>, …). They are <strong>off by default</strong> in the viewer because at small scale many segments overlap and can look like a «spiderweb».</p>
+        <table>
+            <thead><tr><th>Code</th><th>Name</th><th>Description</th></tr></thead>
+            <tbody>
+                <tr><td><code>RESARE</code></td><td>Restricted Area</td><td>Regulated or restricted sea area</td></tr>
+                <tr><td><code>TSSBND</code></td><td>TSS Boundary</td><td>Traffic separation scheme boundary</td></tr>
+                <tr><td><code>TSELNE</code></td><td>TSS Lane</td><td>TSS lane centreline / separator</td></tr>
+                <tr><td><code>TSSLPT</code></td><td>TSS Lane Part</td><td>Part of a TSS lane</td></tr>
+                <tr><td><code>TSSRON</code></td><td>TSS Roundabout</td><td>TSS roundabout</td></tr>
+                <tr><td><code>ISTZNE</code></td><td>Inshore Traffic Zone</td><td>Inshore traffic zone</td></tr>
+                <tr><td><code>ACHBRT</code></td><td>Anchorage Berth</td><td>Anchorage berth limits</td></tr>
+                <tr><td><code>ACHARE</code></td><td>Anchorage Area</td><td>Anchorage area</td></tr>
+            </tbody>
+        </table>
+
+        <h3 id="layer-navigation">Navigation (general routes)</h3>
         <table>
             <thead><tr><th>Code</th><th>Name</th><th>Description</th></tr></thead>
             <tbody>
                 <tr><td><code>DWRTPT</code></td><td>Deep Water Route</td><td>Deep-water route</td></tr>
                 <tr><td><code>TWRTPT</code></td><td>Two-Way Route</td><td>Two-way route</td></tr>
+                <tr><td><code>FAIRWY</code></td><td>Fairway</td><td>Fairway</td></tr>
                 <tr><td><code>FERYRT</code></td><td>Ferry Route</td><td>Ferry route</td></tr>
-                <tr><td><code>ACHBRT</code></td><td>Anchorage</td><td>Anchorage</td></tr>
                 <tr><td><code>RDOCAL</code></td><td>Radio Calling-In Point</td><td>Radio calling-in point</td></tr>
                 <tr><td><code>RDOSTA</code></td><td>Radio Station</td><td>Radio station</td></tr>
+                <tr><td><code>CTRPNT</code></td><td>Control Point</td><td>Traffic control point</td></tr>
+                <tr><td><code>PILPNT</code></td><td>Pile</td><td>Pile / dolphin</td></tr>
+                <tr><td><code>PILBOP</code></td><td>Pile Beacon</td><td>Pile beacon</td></tr>
             </tbody>
         </table>
 
@@ -955,7 +980,7 @@
 
         <br><br>
         <div class="alert alert-info" style="text-align:center">
-            <strong>S-57 Web Viewer</strong> v0.0.3 &mdash; Author: Kim Kilyong, Korea Maritime University &mdash; Contact: <a href="mailto:ejavm83@gmail.com">ejavm83@gmail.com</a> &mdash; Release: 17 May 2026<br>
+            <strong>S-57 Web Viewer</strong> v0.0.4 &mdash; Author: Kim Kilyong, Korea Maritime University &mdash; Contact: <a href="mailto:ejavm83@gmail.com">ejavm83@gmail.com</a> &mdash; Release: 17 May 2026<br>
             <a href="https://github.com/ejavm83/s57viewer">github.com/ejavm83/s57viewer</a>
         </div>
     </main>

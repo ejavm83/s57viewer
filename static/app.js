@@ -11,13 +11,25 @@
         wreck: ['WRECKS'],
         land: ['LNDARE', 'LNDMRK', 'LNDELV', 'LNDRGN', 'LAKARE', 'BUAARE', 'RIVERS', 'CANALS'],
         coastline: ['COALNE', 'SLCONS'],
-        navigation: ['DWRTPT', 'TWRTPT', 'FAIRWY', 'FERYRT', 'RDOCAL', 'RDOSTA', 'ACHBRT', 'ACHARE',
-            'CTRPNT', 'PILPNT', 'PILBOP', 'RESARE', 'TSSBND', 'TSELNE', 'ISTZNE', 'TSSLPT', 'TSSRON'],
+        /** TSS, restricted areas, anchorages — S-52 magenta/purple (CHMGD/TRFC*); dense on overview charts. */
+        traffic: ['RESARE', 'TSSBND', 'TSELNE', 'ISTZNE', 'TSSLPT', 'TSSRON', 'ACHBRT', 'ACHARE'],
+        navigation: ['DWRTPT', 'TWRTPT', 'FAIRWY', 'FERYRT', 'RDOCAL', 'RDOSTA', 'CTRPNT', 'PILPNT', 'PILBOP'],
         infrastructure: ['BRIDGE', 'CBLOHD', 'CBLSUB', 'PIPSOL', 'MORFAC', 'DAMCON', 'PONTON', 'HULKES', 'PYLONS'],
         coverage: ['M_COVR', 'M_QUAL'],
     };
 
-    const enabledCategories = new Set(Object.keys(CATEGORIES));
+    const CLEAN_DISPLAY_CATEGORIES = ['depth', 'coastline', 'navigation'];
+    /** Default: all except `traffic` (TSS / restricted / anchorage outlines often clutter small-scale views). */
+    const enabledCategories = new Set(
+        Object.keys(CATEGORIES).filter(function (c) { return c !== 'traffic'; })
+    );
+
+    const NAV_POINT_LAYERS = new Set([
+        'LIGHTS', 'FOGSIG',
+        'BCNCAR', 'BCNISD', 'BCNLAT', 'BCNSAW', 'BCNSPP', 'RTPBCN', 'TOPMAR',
+        'BOYCAR', 'BOYISD', 'BOYLAT', 'BOYSAW', 'BOYSPP',
+        'PILPNT', 'PILBOP', 'RDOSTA', 'CTRPNT', 'RDOCAL',
+    ]);
     let currentFeatures = null;
     let loadingAbort = null;
     let loadDebounce = null;
@@ -70,8 +82,23 @@
     let bootPreviewPromise = null;
     let bootBundlePrefetch = null;
     let pendingDatasourceResult = null;
-    let cachedFullLoadReport = null;
-    let loadReportDetailsBound = false;
+    const folderLoadLogEntries = [];
+    const FOLDER_LOAD_LOG_MAX = 250;
+    const FOLDER_LOAD_LOG_STORAGE_KEY = 's57viewer-folder-load-log';
+    let lastFolderLoadLogKey = '';
+
+    (function restoreFolderLoadLogFromStorage() {
+        try {
+            const raw = sessionStorage.getItem(FOLDER_LOAD_LOG_STORAGE_KEY);
+            if (!raw) return;
+            const parsed = JSON.parse(raw);
+            if (!Array.isArray(parsed)) return;
+            for (let i = 0; i < parsed.length; i++) {
+                if (parsed[i] && parsed[i].text) folderLoadLogEntries.push(parsed[i]);
+            }
+        } catch (e) { /* ignore */ }
+    })();
+    let lastFolderLoadSummaryAt = null;
     let datasourceDisplaySettled = false;
     const geoJsonFormat = new ol.format.GeoJSON();
     /** Tighter focus than full ENC extent — matches peninsula demo view. */
@@ -88,22 +115,154 @@
 
     function isScaminEnabled() {
         const el = document.getElementById('toggle-scamin');
-        return el ? el.checked : false;
+        return el ? el.checked : true;
+    }
+
+    function passesScaminAtView(props, viewScale) {
+        if (!props) return true;
+        const rawMin = props.SCAMIN;
+        if (rawMin != null && rawMin !== '') {
+            const scamin = Number(rawMin);
+            if (Number.isFinite(scamin) && viewScale > scamin) return false;
+        }
+        const rawMax = props.SCAMAX;
+        if (rawMax != null && rawMax !== '') {
+            const scamax = Number(rawMax);
+            if (Number.isFinite(scamax) && viewScale < scamax) return false;
+        }
+        return true;
     }
 
     function featurePassesZoomFilter(feature, resolution) {
         const layer = feature.get('layer');
-        if (preslibReady && !s52.passesScaleLimits(feature.getProperties())) return false;
-        if (layer === 'SOUNDG' && resolution > 1200) return false;
+        const geomType = feature.getGeometry().getType();
+        const viewScale = zoomToNearestScaleDenom(getZoomLevel());
+        const props = feature.getProperties();
+
+        if (isScaminEnabled() && !passesScaminAtView(props, viewScale)) return false;
+        if (preslibReady && s52.settings.respectScamin && !s52.passesScaleLimits(props)) return false;
+
+        /* Relaxed vs early viewer: match IHO-style overview (e.g. 1:10M) with symbols + soundings. */
+        if (layer === 'SOUNDG' && (resolution > 9000 || viewScale > 45_000_000)) return false;
         if (layer === 'M_COVR' || layer === 'M_QUAL') return false;
-        if (layer === 'LNDRGN' && resolution > 2000) return false;
-        if (layer === 'LNDELV' && resolution > 600) return false;
-        if ((layer === 'LNDMRK' || layer === 'PILPNT') && resolution > 2500) return false;
-        if (layer === 'DEPCNT' && resolution > 2000) return false;
+        if (layer === 'LNDRGN' && resolution > 9000) return false;
+        if (layer === 'LNDELV' && resolution > 3500) return false;
+        if ((layer === 'LNDMRK' || layer === 'PILPNT') && resolution > 9000) return false;
+        if (layer === 'DEPCNT' && (resolution > 9000 || viewScale > 30_000_000)) return false;
         if ((layer === 'OBSTRN' || layer === 'UWTROC' || layer === 'WRECKS')
-            && feature.getGeometry().getType() === 'Point' && resolution > 2500) return false;
-        if (layer === 'TOPMAR' && resolution > 1500) return false;
+            && geomType === 'Point' && (resolution > 9000 || viewScale > 28_000_000)) return false;
+        if (layer === 'TOPMAR' && resolution > 9000) return false;
+
+        if (NAV_POINT_LAYERS.has(layer) && geomType === 'Point') {
+            if (viewScale > 100_000_000) return false;
+            if (viewScale > 35_000_000 && resolution > 12000) return false;
+        }
+        if (geomType === 'Point' && viewScale > 45_000_000
+            && (layer === 'BRIDGE' || layer === 'MORFAC' || layer === 'HULKES')) return false;
         return true;
+    }
+
+    function initDisplayOptionCheckboxes() {
+        document.querySelectorAll('#display-options input[data-category]:not([data-category="all"])')
+            .forEach(function (cb) {
+                cb.checked = enabledCategories.has(cb.dataset.category);
+            });
+        const allCb = document.querySelector('input[data-category="all"]');
+        if (allCb) {
+            const cats = document.querySelectorAll(
+                '#display-options input[data-category]:not([data-category="all"])'
+            );
+            allCb.checked = Array.from(cats).every(function (c) { return c.checked; });
+        }
+    }
+
+    function applyCleanDisplayPreset() {
+        enabledCategories.clear();
+        CLEAN_DISPLAY_CATEGORIES.forEach(function (c) { enabledCategories.add(c); });
+        initDisplayOptionCheckboxes();
+
+        if (preslibReady) {
+            s52.setDisplayCategory('STANDARD');
+            s52.setSettings({
+                respectScamin: true,
+                showSoundings: false,
+                showText: false,
+                showLightDescriptions: false,
+                showBuoyLightLabels: false,
+                showVisibleSectorLights: false,
+            });
+        }
+
+        const dispSel = document.getElementById('display-category-select');
+        if (dispSel) dispSel.value = 'STANDARD';
+        const scaminToggle = document.getElementById('toggle-scamin');
+        if (scaminToggle) scaminToggle.checked = true;
+        const showSnd = document.getElementById('toggle-soundings');
+        if (showSnd) showSnd.checked = false;
+        const showText = document.getElementById('toggle-show-text');
+        if (showText) showText.checked = false;
+        const lightDesc = document.getElementById('toggle-light-desc');
+        if (lightDesc) lightDesc.checked = false;
+        const buoyLabels = document.getElementById('toggle-buoy-labels');
+        if (buoyLabels) buoyLabels.checked = false;
+        const visibleSectors = document.getElementById('toggle-visible-sectors');
+        if (visibleSectors) visibleSectors.checked = false;
+
+        if (preslibReady) {
+            s52.clearStyleCache();
+            lastStyleResolutionBucket = null;
+            lastViewportCacheKey = null;
+            vectorLayer.changed();
+            scheduleViewportLoad();
+        }
+    }
+
+    /** Dense ENC default (IHO S-100-style): all layers, text/soundings, SCAMIN off, display «Other». */
+    function applyFullDisplayPreset() {
+        enabledCategories.clear();
+        Object.keys(CATEGORIES).forEach(function (c) { enabledCategories.add(c); });
+        initDisplayOptionCheckboxes();
+
+        if (preslibReady) {
+            s52.setDisplayCategory('OTHER');
+            s52.setSettings({
+                respectScamin: false,
+                showSoundings: true,
+                showText: true,
+                showLightDescriptions: true,
+                showBuoyLightLabels: true,
+                showVisibleSectorLights: true,
+            });
+        }
+
+        const dispSel = document.getElementById('display-category-select');
+        if (dispSel) dispSel.value = 'OTHER';
+        const scaminToggle = document.getElementById('toggle-scamin');
+        if (scaminToggle) scaminToggle.checked = false;
+        const showSnd = document.getElementById('toggle-soundings');
+        if (showSnd) showSnd.checked = true;
+        const showText = document.getElementById('toggle-show-text');
+        if (showText) showText.checked = true;
+        const lightDesc = document.getElementById('toggle-light-desc');
+        if (lightDesc) lightDesc.checked = true;
+        const buoyLabels = document.getElementById('toggle-buoy-labels');
+        if (buoyLabels) buoyLabels.checked = true;
+        const visibleSectors = document.getElementById('toggle-visible-sectors');
+        if (visibleSectors) visibleSectors.checked = true;
+
+        if (preslibReady) {
+            s52.clearStyleCache();
+            lastStyleResolutionBucket = null;
+            lastViewportCacheKey = null;
+            vectorLayer.changed();
+            scheduleViewportLoad();
+        }
+    }
+
+    function filterFeaturesForDisplay(features) {
+        return features.filter(function (f) {
+            return isLayerVisible(f.get('layer'));
+        });
     }
 
     function syncViewScaleDenom() {
@@ -132,8 +291,10 @@
     const LAYER_ORDER = {
         'UNSARE': 0, 'M_COVR': 1, 'M_QUAL': 1,
         'SEAARE': 2, 'DEPARE': 3, 'DRGARE': 3, 'SBDARE': 3,
-        'LAKARE': 4, 'RIVERS': 4, 'CANALS': 4,
-        'LNDARE': 5, 'BUAARE': 6,
+        /* LNDARE before LAKARE: simplified land must not paint over inland water (e.g. Lake Biwa). */
+        'LNDARE': 4,
+        'LAKARE': 5, 'RIVERS': 5, 'CANALS': 5,
+        'BUAARE': 6,
         'FAIRWY': 7, 'RESARE': 8,
         'TSSBND': 9, 'TSELNE': 9, 'ISTZNE': 9, 'TSSLPT': 9, 'TSSRON': 9,
         'DEPCNT': 10, 'COALNE': 11, 'SLCONS': 12,
@@ -158,18 +319,53 @@
     const vectorLayer = new ol.layer.Vector({
         source: vectorSource,
         style: styleFunction,
-        declutter: false,
+        declutter: true,
         renderBuffer: 256,
         updateWhileAnimating: false,
         updateWhileInteracting: false,
+        zIndex: 1,
         renderOrder: function (a, b) {
             return (a.get('renderOrder') ?? 50) - (b.get('renderOrder') ?? 50);
         },
     });
 
+    /** Cached `/api/index` for “파일 영역 격자” overlay (invalidated on datasource change). */
+    let chartExtentIndexCache = null;
+    let chartExtentGridRebuildTimer = null;
+    /** Monotonic id so only the latest `rebuildChartExtentGrid` run may mutate the layer (avoids async races). */
+    let chartExtentGridBuildSeq = 0;
+
+    const chartExtentGridSource = new ol.source.Vector();
+    const chartExtentGridStyleFn = function (feature) {
+        const kind = feature.get('gridKind');
+        if (kind === 'frame') {
+            return new ol.style.Style({
+                stroke: new ol.style.Stroke({
+                    color: 'rgba(255, 213, 79, 0.88)',
+                    width: 1.5,
+                }),
+            });
+        }
+        return new ol.style.Style({
+            stroke: new ol.style.Stroke({
+                color: 'rgba(255, 213, 79, 0.5)',
+                width: 1,
+                lineDash: [5, 6],
+            }),
+        });
+    };
+    const chartExtentGridLayer = new ol.layer.Vector({
+        source: chartExtentGridSource,
+        style: chartExtentGridStyleFn,
+        visible: false,
+        zIndex: 0,
+        updateWhileAnimating: false,
+        updateWhileInteracting: false,
+    });
+
     const map = window._map = new ol.Map({
         target: 'map',
-        layers: [vectorLayer],
+        layers: [chartExtentGridLayer, vectorLayer],
         view: new ol.View({
             center: ol.proj.fromLonLat([127.5, 36.0]),
             zoom: 7,
@@ -379,6 +575,132 @@
         ];
     }
 
+    function invalidateChartExtentIndexCache() {
+        chartExtentIndexCache = null;
+        chartExtentGridBuildSeq++;
+    }
+
+    function boundsOverlap4326(a, b) {
+        if (!a || !b || a.length !== 4 || b.length !== 4) return false;
+        return !(a[2] < b[0] || a[0] > b[2] || a[3] < b[1] || a[1] > b[3]);
+    }
+
+    function appendChartExtentGridFeatures(features, bounds, cellCount) {
+        const [w, s, e, n] = bounds;
+        if (!(e > w && n > s)) return;
+        const lon = e - w;
+        const lat = n - s;
+        const ring = [
+            ol.proj.fromLonLat([w, s]),
+            ol.proj.fromLonLat([e, s]),
+            ol.proj.fromLonLat([e, n]),
+            ol.proj.fromLonLat([w, n]),
+            ol.proj.fromLonLat([w, s]),
+        ];
+        features.push(new ol.Feature({
+            geometry: new ol.geom.Polygon([ring]),
+            gridKind: 'frame',
+        }));
+        if (!(cellCount > 0)) return;
+        const cells = Math.max(2, Math.min(14, Math.floor(cellCount)));
+        for (let i = 1; i < cells; i++) {
+            const x = w + (lon * i) / cells;
+            features.push(new ol.Feature({
+                geometry: new ol.geom.LineString([
+                    ol.proj.fromLonLat([x, s]),
+                    ol.proj.fromLonLat([x, n]),
+                ]),
+                gridKind: 'cell',
+            }));
+        }
+        for (let j = 1; j < cells; j++) {
+            const y = s + (lat * j) / cells;
+            features.push(new ol.Feature({
+                geometry: new ol.geom.LineString([
+                    ol.proj.fromLonLat([w, y]),
+                    ol.proj.fromLonLat([e, y]),
+                ]),
+                gridKind: 'cell',
+            }));
+        }
+    }
+
+    function scheduleChartExtentGridRefresh() {
+        const el = document.getElementById('toggle-chart-extent-grid');
+        if (!el || !el.checked) return;
+        if (chartExtentGridRebuildTimer) clearTimeout(chartExtentGridRebuildTimer);
+        chartExtentGridRebuildTimer = setTimeout(function () {
+            chartExtentGridRebuildTimer = null;
+            void rebuildChartExtentGrid();
+        }, 140);
+    }
+
+    async function rebuildChartExtentGrid() {
+        const el = document.getElementById('toggle-chart-extent-grid');
+        if (!el || !el.checked || !datasourceReady) {
+            chartExtentGridBuildSeq++;
+            chartExtentGridSource.clear();
+            chartExtentGridLayer.setVisible(false);
+            return;
+        }
+        const size = map.getSize();
+        if (!size || size[0] < 8 || size[1] < 8) return;
+        const buildId = ++chartExtentGridBuildSeq;
+        try {
+            if (!chartExtentIndexCache) {
+                const resp = await fetch('/api/index');
+                if (buildId !== chartExtentGridBuildSeq) return;
+                if (!resp.ok) throw new Error('index ' + resp.status);
+                chartExtentIndexCache = await resp.json();
+            }
+            if (buildId !== chartExtentGridBuildSeq) return;
+            const list = chartExtentIndexCache;
+            if (!Array.isArray(list) || !list.length) {
+                if (buildId !== chartExtentGridBuildSeq) return;
+                chartExtentGridSource.clear();
+                chartExtentGridLayer.setVisible(false);
+                return;
+            }
+            const extent = map.getView().calculateExtent(map.getSize());
+            const [vw, vs] = ol.proj.toLonLat([extent[0], extent[1]]);
+            const [ve, vn] = ol.proj.toLonLat([extent[2], extent[3]]);
+            const [gw, gs, ge, gn] = expandViewportBounds(vw, vs, ve, vn);
+            const viewBounds = [gw, gs, ge, gn];
+            const visible = [];
+            for (let i = 0; i < list.length; i++) {
+                const row = list[i];
+                const b = row && row.bounds;
+                if (b && b.length === 4 && boundsOverlap4326(b, viewBounds)) {
+                    visible.push(b);
+                }
+            }
+            let cellCount = 8;
+            if (visible.length > 80) cellCount = 5;
+            if (visible.length > 200) cellCount = 0;
+
+            const MAX_OVERLAY_CHARTS = 450;
+            let toDraw = visible;
+            if (visible.length > MAX_OVERLAY_CHARTS) {
+                toDraw = visible.slice(0, MAX_OVERLAY_CHARTS);
+                cellCount = 0;
+            }
+
+            const features = [];
+            for (let j = 0; j < toDraw.length; j++) {
+                appendChartExtentGridFeatures(features, toDraw[j], cellCount);
+            }
+            if (buildId !== chartExtentGridBuildSeq) return;
+            chartExtentGridSource.clear();
+            chartExtentGridSource.addFeatures(features);
+            chartExtentGridLayer.setVisible(features.length > 0);
+        } catch (err) {
+            if (buildId !== chartExtentGridBuildSeq) return;
+            console.error('Chart extent grid failed:', err);
+            chartExtentGridSource.clear();
+            chartExtentGridLayer.setVisible(false);
+        }
+    }
+
     function getViewportCacheKey(west, south, east, north, zoom, layers) {
         return [
             roundViewportCoord(west),
@@ -408,10 +730,11 @@
         if (cacheKey && viewportOlCache.has(cacheKey)) {
             return viewportOlCache.get(cacheKey);
         }
-        const features = geoJsonFormat.readFeatures(data, {
+        let features = geoJsonFormat.readFeatures(data, {
             featureProjection: 'EPSG:3857',
             dataProjection: 'EPSG:4326',
         });
+        features = filterFeaturesForDisplay(features);
         assignFeatureRenderOrder(features);
         if (cacheKey) {
             viewportOlCache.set(cacheKey, features);
@@ -525,7 +848,7 @@
             });
         }
 
-        const fetchTimeoutMs = 90000;
+        const fetchTimeoutMs = 120000;
         let abortedByTimeout = false;
         const timeoutId = setTimeout(function () {
             abortedByTimeout = true;
@@ -596,7 +919,8 @@
                 }
             } else if (e.name !== 'AbortError') {
                 console.error('Failed to load charts:', e);
-                if (isViewportUpdate && mapDisplayReady) {
+                const hasDisplayedFeatures = currentFeatures && currentFeatures.length > 0;
+                if (isViewportUpdate && mapDisplayReady && !hasDisplayedFeatures) {
                     vectorSource.clear();
                     currentFeatures = null;
                     lastViewportCacheKey = null;
@@ -685,6 +1009,7 @@
         setMapViewInteracting(false);
         finalizeMapViewAfterInteraction();
         scheduleViewportLoad();
+        scheduleChartExtentGridRefresh();
     }
 
     function pickDisplayBounds(bounds) {
@@ -711,180 +1036,112 @@
         return `W ${bounds[0].toFixed(2)}° S ${bounds[1].toFixed(2)}° E ${bounds[2].toFixed(2)}° N ${bounds[3].toFixed(2)}°`;
     }
 
-    function bindLoadReportDetailsToggle() {
-        if (loadReportDetailsBound) return;
-        const details = document.getElementById('load-report-details');
-        if (!details) return;
-        loadReportDetailsBound = true;
-        details.addEventListener('toggle', () => {
-            if (details.open) void ensureLoadReportDetails();
-        });
+    function formatLogTime(date) {
+        const d = date || new Date();
+        return d.toLocaleTimeString('ko-KR', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
     }
 
-    function renderLoadReportSummary(summary) {
-        const summaryEl = document.getElementById('load-report-summary');
-        if (!summaryEl || !summary) return;
-
-        const cacheNote = summary.from_cache
-            ? 'From cache'
-            : (summary.duration_sec != null ? `${summary.duration_sec}s` : '');
-
-        summaryEl.innerHTML = `
-            <div class="report-stat-grid">
-                <div class="report-stat"><strong>${summary.files_found ?? 0}</strong><span>.000 files found</span></div>
-                <div class="report-stat"><strong>${summary.indexed_ok ?? 0}</strong><span>indexed OK</span></div>
-                <div class="report-stat"><strong>${summary.indexed_failed ?? 0}</strong><span>failed</span></div>
-                <div class="report-stat"><strong>${(summary.layers_per_chart?.avg ?? 0)}</strong><span>avg layers/chart</span></div>
-            </div>
-            ${cacheNote ? `<p class="report-note report-note-compact">${escapeHtml(cacheNote)}</p>` : ''}
-        `;
-    }
-
-    function renderLoadReportExtra(summary) {
-        const extraEl = document.getElementById('load-report-extra');
-        if (!extraEl || !summary) return;
-
-        const bands = summary.scale_bands || {};
-        const bandRows = Object.keys(bands).sort((a, b) => Number(a) - Number(b))
-            .map(b => `<tr><td>${escapeHtml(bands[b].label)}</td><td>${bands[b].count}</td></tr>`)
-            .join('');
-
-        const topLayers = (summary.top_layers || [])
-            .map(l => `<tr><td>${escapeHtml(l.layer)}</td><td>${l.charts}</td></tr>`)
-            .join('');
-
-        extraEl.innerHTML = `
-            <table class="report-scale-table">
-                <thead><tr><th>Scale band</th><th>Charts</th></tr></thead>
-                <tbody>${bandRows || '<tr><td colspan="2">—</td></tr>'}</tbody>
-            </table>
-            ${topLayers ? `<table class="report-scale-table"><thead><tr><th>Top layers</th><th>Charts</th></tr></thead><tbody>${topLayers}</tbody></table>` : ''}
-            <p class="report-note">${escapeHtml(formatBounds(summary.bounds))}</p>
-        `;
-    }
-
-    function renderLoadReportPerChart(report) {
-        const detailEl = document.getElementById('load-report-detail-body');
-        if (!detailEl || !report) return;
-
-        const indexed = report.indexed || [];
-        const failed = report.failed || [];
-        let detailHtml = '';
-
-        if (indexed.length) {
-            detailHtml += `<p><strong>Indexed charts (${indexed.length})</strong></p>
-                <table><thead><tr><th>File</th><th>Scale</th><th>Layers</th><th>Bounds</th></tr></thead><tbody>`;
-            detailHtml += indexed.map(c => {
-                const b = c.bounds;
-                const bStr = b ? `${b[0].toFixed(1)},${b[1].toFixed(1)}–${b[2].toFixed(1)},${b[3].toFixed(1)}` : '—';
-                return `<tr>
-                    <td>${escapeHtml(c.file)}</td>
-                    <td>${escapeHtml(c.scale_label || c.scale)}</td>
-                    <td>${c.layer_count}</td>
-                    <td>${bStr}</td>
-                </tr>`;
-            }).join('');
-            detailHtml += '</tbody></table>';
-        }
-
-        if (failed.length) {
-            detailHtml += `<p class="report-failed"><strong>Failed (${failed.length})</strong></p>
-                <table><thead><tr><th>File</th><th>Error</th></tr></thead><tbody>`;
-            detailHtml += failed.map(c => `<tr class="status-fail">
-                <td>${escapeHtml(c.file)}</td>
-                <td>${escapeHtml(c.error)}</td>
-            </tr>`).join('');
-            detailHtml += '</tbody></table>';
-        }
-
-        if (!detailHtml) {
-            detailHtml = '<p class="report-note">No per-file details.</p>';
-        }
-
-        detailEl.innerHTML = detailHtml;
-    }
-
-    function renderFolderLoadReport(report) {
-        const panel = document.getElementById('load-report-panel');
-        if (!panel || !report?.summary) return;
-
-        bindLoadReportDetailsToggle();
-        renderLoadReportSummary(report.summary);
-
-        const details = document.getElementById('load-report-details');
-        if (details?.open) {
-            renderLoadReportExtra(report.summary);
-            if (report.indexed || report.failed) {
-                renderLoadReportPerChart(report);
-            }
-        } else {
-            document.getElementById('load-report-extra')?.replaceChildren();
-            document.getElementById('load-report-detail-body')?.replaceChildren();
-        }
-
-        if (report.indexed || report.failed) {
-            cachedFullLoadReport = report;
-        } else if (report.summary) {
-            cachedFullLoadReport = { summary: report.summary };
-        }
-
-        panel.classList.remove('hidden');
-    }
-
-    function hideFolderLoadReport() {
-        cachedFullLoadReport = null;
-        const panel = document.getElementById('load-report-panel');
-        panel?.classList.add('hidden');
-        const details = document.getElementById('load-report-details');
-        if (details) details.open = false;
-        document.getElementById('load-report-extra')?.replaceChildren();
-        document.getElementById('load-report-detail-body')?.replaceChildren();
-    }
-
-    async function ensureLoadReportDetails() {
-        const extraEl = document.getElementById('load-report-extra');
-        const detailEl = document.getElementById('load-report-detail-body');
-        if (!extraEl || !detailEl) return;
-
-        if (cachedFullLoadReport?.summary) {
-            renderLoadReportExtra(cachedFullLoadReport.summary);
-            if (cachedFullLoadReport.indexed || cachedFullLoadReport.failed) {
-                renderLoadReportPerChart(cachedFullLoadReport);
-                return;
-            }
-        }
-
-        detailEl.innerHTML = '<p class="report-note">Loading chart list…</p>';
-        if (!cachedFullLoadReport?.summary) {
-            extraEl.innerHTML = '<p class="report-note">Loading details…</p>';
-        }
-
+    function persistFolderLoadLog() {
         try {
-            const resp = await fetch('/api/datasource/report');
-            if (!resp.ok) {
-                extraEl.innerHTML = '<p class="report-note">Could not load details.</p>';
-                return;
-            }
-            const report = await resp.json();
-            cachedFullLoadReport = report;
-            if (report.summary) renderLoadReportSummary(report.summary);
-            renderLoadReportExtra(report.summary || {});
-            renderLoadReportPerChart(report);
-        } catch (e) {
-            console.warn('Could not load folder report:', e);
-            extraEl.innerHTML = '<p class="report-note">Could not load details.</p>';
+            sessionStorage.setItem(FOLDER_LOAD_LOG_STORAGE_KEY, JSON.stringify(folderLoadLogEntries));
+        } catch (e) { /* quota or private mode */ }
+    }
+
+    function notifyAdminConsoleProcessLog() {
+        if (window.S57AdminConsole) {
+            window.S57AdminConsole.setProcessEntries(folderLoadLogEntries);
         }
+    }
+
+    function clearFolderLoadLog() {
+        folderLoadLogEntries.length = 0;
+        lastFolderLoadLogKey = '';
+        lastFolderLoadSummaryAt = null;
+        try { sessionStorage.removeItem(FOLDER_LOAD_LOG_STORAGE_KEY); } catch (e) { /* ignore */ }
+        notifyAdminConsoleProcessLog();
+    }
+
+    function appendFolderLoadLog(text, level) {
+        if (!text) return;
+        const lvl = level || 'info';
+        folderLoadLogEntries.push({
+            time: formatLogTime(),
+            text: String(text),
+            level: lvl,
+        });
+        if (folderLoadLogEntries.length > FOLDER_LOAD_LOG_MAX) {
+            folderLoadLogEntries.splice(0, folderLoadLogEntries.length - FOLDER_LOAD_LOG_MAX);
+        }
+        persistFolderLoadLog();
+        notifyAdminConsoleProcessLog();
+    }
+
+    function appendFolderLoadLogFromProgress(p) {
+        if (!p) return;
+        const parts = [];
+        if (p.files_found > 0 && p.phase === 'scan' && p.current === 0) {
+            parts.push('.000 파일 ' + p.files_found + '개 발견');
+        }
+        if (p.phase === 'upload' && p.current_file) {
+            parts.push('업로드 (' + p.current + '/' + p.total + '): ' + p.current_file);
+        } else if (p.phase === 'index' && p.current_file) {
+            parts.push('인덱싱 (' + p.current + '/' + p.total + '): ' + p.current_file);
+            if (p.indexed_ok > 0 || p.indexed_failed > 0) {
+                parts.push('성공 ' + p.indexed_ok + ' · 실패 ' + p.indexed_failed);
+            }
+        } else if (p.message) {
+            parts.push(p.message);
+        }
+        const line = parts.join(' — ');
+        if (!line) return;
+        const key = [p.phase, p.current, p.total, p.message, p.current_file].join('|');
+        if (key === lastFolderLoadLogKey) return;
+        lastFolderLoadLogKey = key;
+        appendFolderLoadLog(line, p.status === 'error' ? 'error' : 'info');
+    }
+
+    function logFolderLoadSummary(report) {
+        if (!report?.summary) return;
+        const stamp = report.generated_at;
+        if (stamp && stamp === lastFolderLoadSummaryAt) return;
+        lastFolderLoadSummaryAt = stamp;
+        const s = report.summary;
+        let line = '완료: .000 파일 ' + (s.files_found ?? 0) + '개 · 인덱스 성공 ' + (s.indexed_ok ?? 0);
+        if (s.indexed_failed > 0) line += ' · 실패 ' + s.indexed_failed;
+        if (s.from_cache) line += ' (캐시에서 로드)';
+        else if (s.duration_sec != null) line += ' · ' + s.duration_sec + '초';
+        appendFolderLoadLog(line, s.indexed_failed > 0 ? 'warn' : 'ok');
+        const failed = report.failed || [];
+        for (let i = 0; i < Math.min(failed.length, 8); i++) {
+            appendFolderLoadLog('실패: ' + (failed[i].file || failed[i].name) + ' — ' + failed[i].error, 'warn');
+        }
+        if (failed.length > 8) {
+            appendFolderLoadLog('… 외 ' + (failed.length - 8) + '개 파일 실패', 'warn');
+        }
+    }
+
+    function updateDatasourceReportLink(report) {
+        const link = document.getElementById('datasource-report-link');
+        if (!link) return;
+        if (report?.summary) {
+            const s = report.summary;
+            link.classList.remove('hidden');
+            link.textContent = '.000 분석 결과 (' + (s.indexed_ok ?? 0) + '개 성공' +
+                (s.indexed_failed > 0 ? ', ' + s.indexed_failed + '개 실패' : '') + ') →';
+        } else {
+            link.classList.add('hidden');
+        }
+    }
+
+    function hideDatasourceReportLink() {
+        document.getElementById('datasource-report-link')?.classList.add('hidden');
     }
 
     function fetchAndRenderFolderReport(existingReport) {
         if (existingReport?.summary) {
-            if (existingReport.indexed || existingReport.failed) {
-                cachedFullLoadReport = existingReport;
-            }
-            renderFolderLoadReport(existingReport);
-            return;
+            logFolderLoadSummary(existingReport);
+            updateDatasourceReportLink(existingReport);
         }
-        bindLoadReportDetailsToggle();
     }
 
     function renderViewportReport(meta) {
@@ -897,8 +1154,8 @@
             const loaded = meta.charts_loaded ?? 0;
             const matched = meta.charts_matched != null ? meta.charts_matched : loaded;
             const shown = matched > 0 ? matched : (loaded > 0 ? loaded : 0);
-            matchedEl.textContent = meta.charts_capped
-                ? `${shown} (${loaded} drawn, max ${meta.max_charts})`
+            matchedEl.textContent = meta.features_capped && loaded < shown
+                ? `${shown} (${loaded} drawn, feature limit)`
                 : String(shown);
         }
 
@@ -971,7 +1228,7 @@
             pathEl.title = '';
             countEl.textContent = '';
             pathEl.classList.remove('loaded');
-            hideFolderLoadReport();
+            hideDatasourceReportLink();
         }
     }
 
@@ -1002,7 +1259,12 @@
 
     async function finishDatasourceDisplay(data) {
         if (datasourceDisplaySettled) {
-            if (isDefaultSampleLoaded(data) && mapDisplayReady) {
+            /* Folder replace can leave settled true from a prior session; always refresh viewport
+             * data (stale cache would keep wrong/empty charts for the new datasource). */
+            if (data && data.loaded) {
+                viewportChartCache.clear();
+                viewportOlCache.clear();
+                lastViewportCacheKey = null;
                 setTimeout(tryLoadCharts, 50);
             }
             return;
@@ -1083,6 +1345,7 @@
     }
 
     function onDatasourceLoaded(data) {
+        invalidateChartExtentIndexCache();
         datasourceReady = true;
         pendingDatasourceResult = data;
         if (!preslibReady) {
@@ -1100,10 +1363,13 @@
                     indeterminate: true,
                 });
             }
+            scheduleChartExtentGridRefresh();
             return;
         }
         pendingDatasourceResult = null;
-        void finishDatasourceDisplay(data);
+        void finishDatasourceDisplay(data).finally(function () {
+            scheduleChartExtentGridRefresh();
+        });
     }
 
     function setDatasourceButtonsDisabled(disabled) {
@@ -1124,7 +1390,18 @@
     }
 
     function beginFolderLoadUI(message) {
-        hideFolderLoadReport();
+        hideDatasourceReportLink();
+        clearFolderLoadLog();
+        invalidateChartExtentIndexCache();
+        chartExtentGridSource.clear();
+        chartExtentGridLayer.setVisible(false);
+        viewportChartCache.clear();
+        viewportOlCache.clear();
+        lastViewportCacheKey = null;
+        appendFolderLoadLog(message || '폴더 불러오기 시작…', 'info');
+        if (isAdminMode() && window.S57AdminConsole) {
+            window.S57AdminConsole.open('process');
+        }
         datasourceDisplaySettled = false;
         bootPreviewActive = false;
         showLoading(true);
@@ -1159,6 +1436,39 @@
         return new Promise(resolve => setTimeout(resolve, ms));
     }
 
+    function isTransientFetchError(err) {
+        if (!err) return false;
+        const msg = String(err.message || err).toLowerCase();
+        return (
+            err.name === 'TypeError' ||
+            msg.includes('failed to fetch') ||
+            msg.includes('networkerror') ||
+            msg.includes('load failed')
+        );
+    }
+
+    async function fetchJsonWithRetry(url, options, retryOpts) {
+        const maxAttempts = (retryOpts && retryOpts.maxAttempts) || 40;
+        const delayMs = (retryOpts && retryOpts.delayMs) || 500;
+        let lastError = null;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                const resp = await fetch(url, options);
+                return resp;
+            } catch (err) {
+                lastError = err;
+                if (!isTransientFetchError(err) || attempt >= maxAttempts) {
+                    throw err;
+                }
+                if (retryOpts && retryOpts.onRetry) {
+                    retryOpts.onRetry(attempt, maxAttempts);
+                }
+                await sleep(delayMs);
+            }
+        }
+        throw lastError || new Error('Failed to fetch');
+    }
+
     function updateProgressUI(opts) {
         const messageEl = document.getElementById('loading-message');
         const progressEl = document.getElementById('loading-progress');
@@ -1181,8 +1491,38 @@
     }
 
     async function waitForDatasourceLoad() {
+        let reconnecting = false;
         while (true) {
-            const resp = await fetch('/api/datasource/progress');
+            let resp;
+            try {
+                resp = await fetchJsonWithRetry('/api/datasource/progress', undefined, {
+                    maxAttempts: 60,
+                    delayMs: 500,
+                    onRetry(attempt) {
+                        if (!reconnecting) {
+                            reconnecting = true;
+                            updateProgressUI({
+                                message: 'Server reconnecting — resuming chart load…',
+                                percent: null,
+                                detail: '',
+                                indeterminate: true,
+                            });
+                        }
+                    },
+                });
+            } catch (err) {
+                if (isTransientFetchError(err)) {
+                    const dsResp = await fetchJsonWithRetry('/api/datasource', undefined, {
+                        maxAttempts: 20,
+                        delayMs: 500,
+                    });
+                    const ds = await dsResp.json();
+                    if (ds.loaded) return ds;
+                }
+                throw err;
+            }
+
+            reconnecting = false;
             const p = await resp.json();
 
             let detail = '';
@@ -1197,20 +1537,30 @@
                 detail,
                 indeterminate: p.total <= 0 && p.status === 'running',
             });
+            appendFolderLoadLogFromProgress(p);
 
             if (p.status === 'done') {
                 if (!p.result) {
-                    const ds = await fetch('/api/datasource').then(r => r.json());
+                    const dsResp = await fetchJsonWithRetry('/api/datasource');
+                    const ds = await dsResp.json();
                     if (!ds.loaded) throw new Error('Load finished but chart data is unavailable.');
                     return ds;
                 }
                 return p.result;
             }
             if (p.status === 'error') {
+                appendFolderLoadLog(p.error || p.message || '차트 데이터 로드 실패', 'error');
                 throw new Error(p.error || p.message || 'Failed to load chart data');
             }
             if (p.status === 'idle') {
-                throw new Error('Load was interrupted');
+                const dsResp = await fetch('/api/datasource');
+                if (dsResp.ok) {
+                    const ds = await dsResp.json();
+                    if (ds.loaded) return ds;
+                }
+                throw new Error(
+                    'Load was interrupted (the dev server may have restarted). Try Select folder again.'
+                );
             }
 
             await sleep(300);
@@ -1220,13 +1570,14 @@
     async function uploadFolderCharts(files) {
         const chartFiles = files.filter(f => f.name && f.name.toLowerCase().endsWith('.000'));
         if (!chartFiles.length) {
+            appendFolderLoadLog('선택한 폴더에 .000 파일이 없습니다.', 'warn');
             setDatasourceStatusMessage('No .000 chart files in the selected folder.');
             showLoading(false);
             finishFolderLoadUI();
             return;
         }
 
-        beginFolderLoadUI(`Uploading ${chartFiles.length} chart file(s)…`);
+        beginFolderLoadUI('브라우저에서 ' + chartFiles.length + '개 .000 파일 업로드 중…');
         const form = new FormData();
         for (const file of chartFiles) {
             const rel = file.webkitRelativePath || file.name;
@@ -1243,6 +1594,7 @@
             await completeDatasourceLoadFromResponse(data);
         } catch (e) {
             console.error(e);
+            appendFolderLoadLog('폴더 업로드 실패: ' + e.message, 'error');
             alert('Could not load folder:\n' + e.message);
             setDatasourceStatusMessage('Folder upload failed');
             showLoading(false);
@@ -1303,6 +1655,7 @@
             await completeDatasourceLoadFromResponse(data);
         } catch (e) {
             console.error(e);
+            appendFolderLoadLog('폴더 불러오기 실패: ' + e.message, 'error');
             alert('Could not load folder:\n' + e.message);
             setDatasourceStatusMessage('Could not load folder');
             showLoading(false);
@@ -1473,6 +1826,16 @@
         vectorLayer.setVisible(this.checked);
     });
 
+    document.getElementById('toggle-chart-extent-grid')?.addEventListener('change', function () {
+        if (this.checked) {
+            void rebuildChartExtentGrid();
+        } else {
+            chartExtentGridBuildSeq++;
+            chartExtentGridSource.clear();
+            chartExtentGridLayer.setVisible(false);
+        }
+    });
+
     // Feature popup on double-click (Display Option enabled layers only; topmost drawn feature wins)
     map.on('dblclick', function (evt) {
         const resolution = map.getView().getResolution();
@@ -1531,8 +1894,11 @@
             'BRIDGE': 'Bridge', 'FERYRT': 'Ferry Route', 'RDOSTA': 'Radio Station',
             'PILPNT': 'Pile', 'TOPMAR': 'Top Mark', 'RTPBCN': 'Radar Transponder',
             'CBLOHD': 'Overhead Cable', 'CBLSUB': 'Submarine Cable', 'PIPSOL': 'Pipeline',
-            'ACHBRT': 'Anchorage', 'DWRTPT': 'Deep Water Route', 'TWRTPT': 'Two-Way Route',
-            'SEAARE': 'Sea Area', 'LAKARE': 'Lake', 'MORFAC': 'Mooring Facility',
+            'ACHBRT': 'Anchorage Berth', 'ACHARE': 'Anchorage Area',
+            'RESARE': 'Restricted Area', 'TSSBND': 'TSS Boundary', 'TSELNE': 'TSS Lane',
+            'TSSLPT': 'TSS Lane Part', 'TSSRON': 'TSS Roundabout', 'ISTZNE': 'Inshore Traffic Zone',
+            'FAIRWY': 'Fairway', 'DWRTPT': 'Deep Water Route', 'TWRTPT': 'Two-Way Route',
+            'SEAARE': 'Sea Area', 'LAKARE': 'Lake', 'MORFAC': 'Mooring Facility', 'DRGARE': 'Dredged Area',
             'M_COVR': 'Coverage', 'M_QUAL': 'Quality',
         };
         return code + ' (' + (descriptions[code] || 'Unknown') + ')';
@@ -1952,13 +2318,13 @@
             });
         }
         try {
-            await s52.load('/s52-preslib.json?v=9');
+            await s52.load('/s52-preslib.json?v=10');
             preslibReady = true;
+            applyFullDisplayPreset();
             attachPresLibControls();
             syncViewScaleDenom();
             const sea = s52.getSeaColor();
             document.getElementById('map').style.backgroundColor = sea;
-            updateLegendColors();
             vectorLayer.changed();
 
             const bootShown = await tryBootPreview();
@@ -2002,41 +2368,10 @@
         }
     }
 
-    function updateLegendColors() {
-        const c = (t) => s52.color(t);
-        const legend = document.getElementById('legend');
-        if (!legend) return;
-        const items = legend.querySelectorAll('.legend-item');
-        const swatches = [
-            c('LANDA'), c('DEPVS'), c('DEPMS'), c('DEPMD'),
-            c('CHYLW'), c('CHRED'), c('CHGRN'), '#000', c('CHGRD'),
-        ];
-        items.forEach((item, i) => {
-            const sw = item.querySelector('.legend-swatch:not(.swatch-circle):not(.swatch-x):not(.swatch-star)');
-            if (sw && swatches[i]) sw.style.background = swatches[i];
-        });
-        const circles = legend.querySelectorAll('.swatch-circle');
-        if (circles[0]) circles[0].style.background = c('CHYLW');
-        if (circles[1]) circles[1].style.background = c('CHRED');
-        if (circles[2]) circles[2].style.background = c('CHGRN');
-        const note = document.querySelector('.legend-note');
-        if (note) {
-            const labelMap = {
-                DAY_BRIGHT: 'Day (bright)',
-                DAY_BLACKBACK: 'Day (black background)',
-                DAY_WHITEBACK: 'Day (white background)',
-                DUSK: 'Dusk',
-                NIGHT: 'Night',
-            };
-            note.textContent = `IHO S-52 PresLib (${labelMap[s52.palette] || s52.palette})`;
-        }
-    }
-
     function refreshAfterPresLibChange() {
         if (!preslibReady) return;
         syncViewScaleDenom();
         document.getElementById('map').style.backgroundColor = s52.getSeaColor();
-        updateLegendColors();
         lastViewportCacheKey = null;
         lastStyleResolutionBucket = null;
         viewportOlCache.clear();
@@ -2111,6 +2446,10 @@
                 refreshAfterPresLibChange();
             });
         }
+        if (showSnd) s52.setSettings({ showSoundings: showSnd.checked });
+        if (showText) s52.setSettings({ showText: showText.checked });
+        if (lightDesc) s52.setSettings({ showLightDescriptions: lightDesc.checked });
+        if (buoyLabels) s52.setSettings({ showBuoyLightLabels: buoyLabels.checked });
         if (dispSel) s52.setDisplayCategory(dispSel.value);
     }
 
@@ -2118,6 +2457,17 @@
     document.getElementById('folder-file-input')?.addEventListener('change', onFolderInputChange);
 
     const SIDEBAR_VISIBLE_KEY = 's57viewer-sidebar-visible';
+    const SIDEBAR_WIDTH_KEY = 's57viewer-sidebar-width';
+    const SIDEBAR_WIDTH_DEFAULT = 420;
+    const SIDEBAR_WIDTH_MIN = 260;
+
+    function getSidebarWidthMax() {
+        return Math.min(900, Math.floor(window.innerWidth * 0.65));
+    }
+
+    function clampSidebarWidth(px) {
+        return Math.max(SIDEBAR_WIDTH_MIN, Math.min(getSidebarWidthMax(), Math.round(px)));
+    }
 
     function setSidebarVisible(visible) {
         const main = document.getElementById('main-container');
@@ -2133,9 +2483,95 @@
         });
     }
 
-    (function initSidebarToggle() {
+    (function initSidebar() {
+        const main = document.getElementById('main-container');
         const toggle = document.getElementById('sidebar-toggle');
         const showBtn = document.getElementById('sidebar-show-btn');
+        const resizeHandle = document.getElementById('sidebar-resize-handle');
+        if (!main) return;
+
+        let currentSidebarWidth = SIDEBAR_WIDTH_DEFAULT;
+        try {
+            const stored = parseInt(localStorage.getItem(SIDEBAR_WIDTH_KEY), 10);
+            if (Number.isFinite(stored) && stored > 0) currentSidebarWidth = stored;
+        } catch (e) { /* ignore */ }
+
+        function applySidebarWidth(px, persist) {
+            currentSidebarWidth = clampSidebarWidth(px);
+            main.style.setProperty('--sidebar-width', currentSidebarWidth + 'px');
+            if (persist) {
+                try {
+                    localStorage.setItem(SIDEBAR_WIDTH_KEY, String(currentSidebarWidth));
+                } catch (e) { /* ignore */ }
+            }
+            return currentSidebarWidth;
+        }
+
+        applySidebarWidth(currentSidebarWidth, false);
+
+        let resizeRaf = 0;
+        function scheduleMapResize() {
+            if (resizeRaf) return;
+            resizeRaf = requestAnimationFrame(function () {
+                resizeRaf = 0;
+                map.updateSize();
+            });
+        }
+
+        let dragging = false;
+        let dragStartX = 0;
+        let dragStartWidth = 0;
+
+        function endSidebarResize(persist) {
+            if (!dragging) return;
+            dragging = false;
+            main.classList.remove('sidebar-resizing');
+            document.body.classList.remove('sidebar-resize-active');
+            if (persist) applySidebarWidth(currentSidebarWidth, true);
+            scheduleMapResize();
+        }
+
+        resizeHandle?.addEventListener('pointerdown', function (e) {
+            if (main.classList.contains('sidebar-hidden')) return;
+            if (e.button !== 0) return;
+            e.preventDefault();
+            dragging = true;
+            dragStartX = e.clientX;
+            dragStartWidth = currentSidebarWidth;
+            main.classList.add('sidebar-resizing');
+            document.body.classList.add('sidebar-resize-active');
+            resizeHandle.setPointerCapture(e.pointerId);
+        });
+
+        resizeHandle?.addEventListener('pointermove', function (e) {
+            if (!dragging) return;
+            applySidebarWidth(dragStartWidth + (e.clientX - dragStartX), false);
+            scheduleMapResize();
+        });
+
+        resizeHandle?.addEventListener('pointerup', function () {
+            endSidebarResize(true);
+        });
+
+        resizeHandle?.addEventListener('pointercancel', function () {
+            endSidebarResize(false);
+        });
+
+        resizeHandle?.addEventListener('keydown', function (e) {
+            if (main.classList.contains('sidebar-hidden')) return;
+            let delta = 0;
+            if (e.key === 'ArrowLeft') delta = -16;
+            else if (e.key === 'ArrowRight') delta = 16;
+            else return;
+            e.preventDefault();
+            applySidebarWidth(currentSidebarWidth + delta, true);
+            scheduleMapResize();
+        });
+
+        window.addEventListener('resize', function () {
+            applySidebarWidth(currentSidebarWidth, true);
+        });
+
         let visible = true;
         try {
             const stored = localStorage.getItem(SIDEBAR_VISIBLE_KEY);
@@ -2143,7 +2579,7 @@
         } catch (e) { /* ignore */ }
         setSidebarVisible(visible);
         toggle?.addEventListener('click', function () {
-            const isHidden = document.getElementById('main-container')?.classList.contains('sidebar-hidden');
+            const isHidden = main.classList.contains('sidebar-hidden');
             setSidebarVisible(isHidden);
         });
         showBtn?.addEventListener('click', function () {
@@ -2166,6 +2602,15 @@
 
     map.updateSize();
     window.addEventListener('resize', () => map.updateSize());
+    document.addEventListener('admin-console-resize', () => map.updateSize());
+
+    document.addEventListener('admin-console-clear-process', clearFolderLoadLog);
+    document.addEventListener('admin-console-ready', notifyAdminConsoleProcessLog);
+
+    document.getElementById('about-open-console')?.addEventListener('click', function (evt) {
+        evt.preventDefault();
+        if (window.S57AdminConsole) window.S57AdminConsole.open('server');
+    });
 
     isFittingView = true;
     map.getView().fit(
@@ -2190,6 +2635,8 @@
         });
     }
 
+    initDisplayOptionCheckboxes();
+    document.getElementById('btn-clean-display')?.addEventListener('click', applyCleanDisplayPreset);
     initPreslib();
     ensureDefaultSampleOnConnect();
     loadVisitorStats();

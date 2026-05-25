@@ -4,8 +4,8 @@ const CACHE_VERSION = 'boot-v2';
 const CACHE_NAME = 's57-viewer-' + CACHE_VERSION;
 
 const PRECACHE_URLS = [
-    '/s52-preslib.js?v=11',
-    '/s52-preslib.json?v=9',
+    '/s52-preslib.js?v=17',
+    '/s52-preslib.json?v=10',
     '/boot-cache.js?v=10',
     '/default-viewport.json?v=1',
     '/s52-settings.json',

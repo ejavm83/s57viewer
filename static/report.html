@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>S-57 Viewer — .000 파일 분석 보고서</title>
+    <script>try{if(sessionStorage.getItem('s57viewer-admin-mode')==='1')document.documentElement.classList.add('admin-mode');}catch(e){}</script>
+    <link rel="stylesheet" href="report.css">
+</head>
+<body>
+<nav class="top-nav">
+    <a href="/" class="logo">
+        <svg viewBox="0 0 40 40" width="32" height="32" aria-hidden="true"><circle cx="20" cy="20" r="18" fill="none" stroke="#FFB300" stroke-width="2"/><circle cx="20" cy="20" r="3" fill="#FFB300"/></svg>
+        <span>S-57 Web Viewer</span>
+    </a>
+    <div class="nav-links">
+        <a href="/">Viewer</a>
+        <a href="/report.html" class="active">Analysis</a>
+        <button type="button" id="admin-mode-toggle" class="nav-admin-toggle" aria-pressed="false" title="Admin (Shift+F12)">Admin</button>
+        <a href="/docs.html" class="admin-only">Documentation</a>
+        <a href="/logs.html" class="admin-only">Logs</a>
+    </div>
+</nav>
+
+<main class="page">
+    <header class="page-header">
+        <h1>.000 파일 분석 보고서</h1>
+        <p class="subtitle" id="report-subtitle">차트 폴더 로드·인덱싱 결과를 파일별로 상세히 표시합니다.</p>
+        <div class="page-actions">
+            <button type="button" id="btn-refresh" class="btn primary">새로고침</button>
+            <button type="button" id="btn-copy-json" class="btn">JSON 복사</button>
+            <button type="button" id="btn-export-csv" class="btn">차트 목록 CSV</button>
+            <a href="/" class="btn link-btn">지도로 돌아가기</a>
+        </div>
+    </header>
+
+    <div id="report-error" class="report-banner error hidden" role="alert"></div>
+    <div id="report-loading" class="report-loading">보고서를 불러오는 중…</div>
+
+    <div id="report-content" class="report-content hidden">
+        <section class="report-section" id="section-meta">
+            <h2>데이터 소스</h2>
+            <div class="meta-grid" id="meta-grid"></div>
+        </section>
+
+        <section class="report-section" id="section-summary">
+            <h2>요약</h2>
+            <div class="stat-grid" id="summary-stats"></div>
+        </section>
+
+        <section class="report-section" id="section-scales">
+            <h2>축척 밴드 분포</h2>
+            <div class="table-wrap" id="scale-table-wrap"></div>
+        </section>
+
+        <section class="report-section" id="section-layers">
+            <h2>레이어 통계</h2>
+            <div class="layer-stats-row" id="layer-stats-row"></div>
+            <div class="table-wrap" id="layer-table-wrap"></div>
+        </section>
+
+        <section class="report-section" id="section-log">
+            <h2>처리 로그 <span class="section-hint" id="log-count-hint"></span></h2>
+            <div class="log-panel" id="process-log-panel"></div>
+        </section>
+
+        <section class="report-section" id="section-indexed">
+            <h2>인덱싱 성공 <span class="section-hint" id="indexed-count-hint"></span></h2>
+            <div class="toolbar">
+                <label>검색 <input type="search" id="indexed-search" placeholder="파일명, 경로, 레이어…" autocomplete="off"></label>
+                <label>축척 밴드
+                    <select id="indexed-scale-filter">
+                        <option value="">전체</option>
+                    </select>
+                </label>
+                <label>정렬
+                    <select id="indexed-sort">
+                        <option value="file">파일명</option>
+                        <option value="scale">축척 밴드</option>
+                        <option value="layers-desc">레이어 수 (많은 순)</option>
+                        <option value="layers-asc">레이어 수 (적은 순)</option>
+                    </select>
+                </label>
+            </div>
+            <div class="table-wrap table-wrap-tall" id="indexed-table-wrap"></div>
+        </section>
+
+        <section class="report-section hidden" id="section-failed">
+            <h2>인덱싱 실패 <span class="section-hint fail" id="failed-count-hint"></span></h2>
+            <div class="table-wrap" id="failed-table-wrap"></div>
+        </section>
+    </div>
+</main>
+
+<script src="admin-mode.js"></script>
+<script src="report.js"></script>
+</body>
+</html>

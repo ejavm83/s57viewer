@@ -42,12 +42,20 @@
         showText: true,
         showLightDescriptions: true,
         showBuoyLightLabels: true,
-        showVisibleSectorLights: false,
+        showVisibleSectorLights: true,
         imperialLightText: true,
     };
 
     const LINE_DASH = { SOLD: null, DASH: [8, 4], DOTT: [2, 4] };
     const NM_METERS = 1852;
+    /**
+     * Nominal-range ring thickness in metres (geodesic annulus).
+     * S-52 LIGHTS90–96 rasters are thin in *pixel* space; using a fraction of VALNMR
+     * (e.g. 13% of 20 NM) draws multi-km bands that look nothing like OpenCPN.
+     */
+    const LIGHT_NOMINAL_RANGE_BAND_MIN_M = 85;
+    const LIGHT_NOMINAL_RANGE_BAND_MAX_M = 380;
+    const LIGHT_NOMINAL_RANGE_BAND_REL = 0.018;
     const MM_PER_INCH = 25.4;
     const DEFAULT_DPI = 96;
     const SYMBOL_SCALE_MM = 4.5;
@@ -307,6 +315,7 @@
             const target = palettes[name] ? name : (palettes[this.palette] ? this.palette : 'DAY_BRIGHT');
             this.palette = target;
             this.colors = palettes[target] || {};
+            this._applyReferenceEncDayColors(target);
             this.spriteUrl = this.spriteSources[target] || this.spriteUrl;
             this.clearStyleCache();
             this._symbolCache.clear();
@@ -360,7 +369,36 @@
             return this.colors[key] || this.colors[token] || fallback || '#888888';
         }
 
-        getSeaColor() { return this.color('DEPDW', '#9fc5e8'); }
+        getSeaColor() { return this.color('DEPDW', '#dcebeb'); }
+
+        /**
+         * Match common ENC / OpenCPN-style DAY view: pale blue-grey sea, tan land, saturated lake blue (see UI reference).
+         * Only adjusts DAY_BRIGHT so other palettes stay close to IHO PresLib defaults.
+         */
+        _applyReferenceEncDayColors(paletteName) {
+            if (paletteName !== 'DAY_BRIGHT') return;
+            Object.assign(this.colors, {
+                LANDA0: '#bea064',
+                LANDF0: '#8a6a2d',
+                DEPDW0: '#dcebeb',
+                DEPMD0: '#d4e8eb',
+                DEPMS0: '#cce4ea',
+                DEPVS0: '#c0dde8',
+            });
+        }
+
+        /**
+         * Inland water (LAKARE / river-canal areas): PresLib uses shallow-sea blues — use reference lake blue vs open sea.
+         */
+        _inlandFreshWaterFillColor() {
+            const p = String(this.palette || '').toUpperCase();
+            if (p.includes('NIGHT')) return '#3b6ec9';
+            if (p.includes('DUSK')) return '#3d7dd4';
+            if (p === 'DAY_BRIGHT' || p === 'DAY_WHITEBACK') return '#4a90e2';
+            if (p.includes('BLACK')) return '#5a9eef';
+            if (p.includes('WHITE')) return '#4285d6';
+            return '#4a90e2';
+        }
 
         // ---- Lookup matching ------------------------------------------------
 
@@ -538,9 +576,9 @@
             const bm = entry.bitmap;
             const dim = Math.max(bm.w, bm.h, 1);
             return this._buildRasterIcon(symName, 0, {
-                targetPx: dim * 0.92,
-                scaleMin: 0.55,
-                scaleMax: 2.0,
+                targetPx: dim * 0.78,
+                scaleMin: 0.45,
+                scaleMax: 1.1,
             });
         }
 
@@ -854,67 +892,174 @@
             return {
                 kind: 'range_circle',
                 stroke: this.color(strokeTok),
-                radius: big ? 23 : 16,
-                strokeWidth: 2,
+                radius: big ? 17 : 12,
+                strokeWidth: 1.25,
             };
         }
 
         _lightsCsp(props, resolution) {
             const colours = parseColourList(props);
             const code = colours.length ? colours[0] : NaN;
-            const tok = this._lightColourToken(code);
             const symbolName = this._lightSymbolName(code);
             const sectr1 = num(props.SECTR1);
             const sectr2 = num(props.SECTR2);
             const valnmr = num(props.VALNMR);
             const sectors = [];
             const allround = this._isAllroundLight(props);
-            let rangeCircleSymbol = allround ? this._lightRangeCircleSymbol(code, valnmr) : null;
-            let rangeCircleFallback = allround ? this._lightRangeCircleFallback(code, valnmr) : null;
-
-            // Geographic sector arcs only when zoomed in; overview uses fixed-size circles.
             const geoSectorMaxRes = 2500;
-            if (this.settings.showVisibleSectorLights && resolution < geoSectorMaxRes && !allround) {
-                const radiusM = this._lightSectorRadiusM(valnmr);
-                if (radiusM > 0) {
-                    const hasSectr = Number.isFinite(sectr1) && Number.isFinite(sectr2)
-                        && !(sectr1 === 0 && sectr2 === 0);
-                    if (!hasSectr) {
-                        sectors.push({
-                            sectr1: 0,
-                            sectr2: 360,
-                            radiusM,
-                            stroke: this.color('LITYW'),
-                            strokeWidth: 1.2,
-                            legs: false,
-                        });
-                    } else {
-                        let sweep = sectr2 - sectr1;
-                        if (sweep < 0) sweep += 360;
-                        if (sweep >= 359.5) {
-                            sectors.push({
-                                sectr1: 0,
-                                sectr2: 360,
-                                radiusM,
-                                stroke: this.color('LITYW'),
-                                strokeWidth: 1.2,
-                                legs: false,
-                            });
-                        } else if (sweep > 0) {
-                            sectors.push({
-                                sectr1,
-                                sectr2,
-                                radiusM,
-                                stroke: this.color(tok),
-                                strokeWidth: 1.2,
-                                legs: true,
-                            });
-                        }
+            const radiusM = this._lightSectorRadiusM(valnmr);
+
+            let rangeCircleSymbol = null;
+            let rangeCircleFallback = null;
+
+            /**
+             * OpenCPN-style LIGHTS05: all-round lights always use fixed chart symbols LIGHTS90–96
+             * (big vs small by VALNMR ≥ 5 NM), not a true-scale geodesic ring — otherwise radii
+             * swing wildly vs ENC symbols.
+             *
+             * Sector (directional) lights: VALNMR → geodesic nominal-range annulus in Web Mercator,
+             * with optional visible-sector gap when «Visible sector lights» is on and zoomed in.
+             */
+            if (radiusM > 0 && !allround) {
+                sectors.push(this._lightNominalRangeAnnulusSpec({
+                    sectr1, sectr2, radiusM, allround, resolution, geoSectorMaxRes,
+                }));
+            }
+            if (allround) {
+                rangeCircleSymbol = this._lightRangeCircleSymbol(code, valnmr);
+                rangeCircleFallback = this._lightRangeCircleFallback(code, valnmr);
+            }
+
+            return { symbolName, sectors, rangeCircleSymbol, rangeCircleFallback };
+        }
+
+        _normDeg360(d) {
+            if (!Number.isFinite(d)) return 0;
+            let x = d % 360;
+            if (x < 0) x += 360;
+            return x;
+        }
+
+        /**
+         * @returns {{ nominalRangeAnnulus: true, outerM: number, innerM: number, arcStartDeg: number,
+         *            arcEndDeg: number, legBearingsDeg: number[]|null }}
+         */
+        _lightNominalRangeAnnulusSpec({ sectr1, sectr2, radiusM, allround, resolution, geoSectorMaxRes }) {
+            const bandM = Math.min(
+                LIGHT_NOMINAL_RANGE_BAND_MAX_M,
+                Math.max(LIGHT_NOMINAL_RANGE_BAND_MIN_M, radiusM * LIGHT_NOMINAL_RANGE_BAND_REL)
+            );
+            const innerM = Math.max(0, radiusM - bandM);
+            let arcStartDeg = 0;
+            let arcEndDeg = 360;
+            let legBearingsDeg = null;
+
+            const hasSectr = Number.isFinite(sectr1) && Number.isFinite(sectr2)
+                && !(sectr1 === 0 && sectr2 === 0);
+
+            if (!allround && this.settings.showVisibleSectorLights && resolution < geoSectorMaxRes && hasSectr) {
+                const s1 = this._normDeg360(sectr1);
+                const s2 = this._normDeg360(sectr2);
+                let visSweep = s2 - s1;
+                if (visSweep < 0) visSweep += 360;
+                if (visSweep > 0.5 && visSweep < 359.5) {
+                    const compSweep = 360 - visSweep;
+                    arcStartDeg = s2;
+                    arcEndDeg = s2 + compSweep;
+                    legBearingsDeg = [s1, s2];
+                    if (compSweep >= 359.5) {
+                        arcStartDeg = 0;
+                        arcEndDeg = 360;
+                        legBearingsDeg = null;
                     }
                 }
             }
 
-            return { symbolName, sectors, rangeCircleSymbol, rangeCircleFallback };
+            return {
+                nominalRangeAnnulus: true,
+                outerM: radiusM,
+                innerM,
+                arcStartDeg,
+                arcEndDeg,
+                legBearingsDeg,
+            };
+        }
+
+        _navAnnulusPolygon(lonLat, outerM, innerM, arcStartDeg, arcEndDeg) {
+            let sweep = arcEndDeg - arcStartDeg;
+            while (sweep <= 0) sweep += 360;
+            while (sweep > 360.0001) sweep -= 360;
+
+            if (sweep >= 359.5) {
+                const sides = 128;
+                const outer = [];
+                const innerHole = [];
+                for (let i = 0; i <= sides; i++) {
+                    const br = ((i / sides) * 2 * Math.PI);
+                    outer.push(ol.proj.fromLonLat(ol.sphere.offset(lonLat, outerM, br)));
+                }
+                for (let i = sides; i >= 0; i--) {
+                    const br = ((i / sides) * 2 * Math.PI);
+                    innerHole.push(ol.proj.fromLonLat(ol.sphere.offset(lonLat, innerM, br)));
+                }
+                return new ol.geom.Polygon([outer, innerHole]);
+            }
+
+            const steps = Math.max(48, Math.min(220, Math.ceil(sweep / 1.2)));
+            const outer = [];
+            const inner = [];
+            for (let i = 0; i <= steps; i++) {
+                const t = i / steps;
+                const angDeg = arcStartDeg + sweep * t;
+                const br = (angDeg * Math.PI) / 180;
+                outer.push(ol.proj.fromLonLat(ol.sphere.offset(lonLat, outerM, br)));
+            }
+            for (let i = 0; i <= steps; i++) {
+                const t = i / steps;
+                const angDeg = arcStartDeg + sweep * t;
+                const br = (angDeg * Math.PI) / 180;
+                inner.push(ol.proj.fromLonLat(ol.sphere.offset(lonLat, innerM, br)));
+            }
+            const ring = outer.slice();
+            for (let i = inner.length - 1; i >= 0; i--) ring.push(inner[i]);
+            const first = ring[0];
+            const last = ring[ring.length - 1];
+            if (first[0] !== last[0] || first[1] !== last[1]) ring.push(first.slice());
+            return new ol.geom.Polygon([ring]);
+        }
+
+        _lightNominalRangeStyleParts(center, sec) {
+            if (!sec.nominalRangeAnnulus) return [];
+            const lonLat = ol.proj.toLonLat(center);
+            const outline = this.color('CHBLK');
+            const poly = this._navAnnulusPolygon(lonLat, sec.outerM, sec.innerM, sec.arcStartDeg, sec.arcEndDeg);
+            /** Fill CHYLW + OUTLW-style halo like OpenCPN DAY_BRIGHT raster (mOUTLWHCHYLW). */
+            const fillCol = this.color('CHYLW');
+            const haloCol = this.color('CHWHT');
+            const parts = [
+                {
+                    geometry: poly,
+                    fill: fillCol,
+                    stroke: { color: haloCol, width: 1.25 },
+                },
+                {
+                    geometry: poly,
+                    stroke: { color: outline, width: 0.85 },
+                },
+            ];
+            if (sec.legBearingsDeg && sec.legBearingsDeg.length === 2) {
+                const dash = [5, 5];
+                for (const bd of sec.legBearingsDeg) {
+                    if (!Number.isFinite(bd)) continue;
+                    const br = (bd * Math.PI) / 180;
+                    const tip = ol.proj.fromLonLat(ol.sphere.offset(lonLat, sec.outerM, br));
+                    parts.push({
+                        geometry: new ol.geom.LineString([center, tip]),
+                        stroke: { color: outline, width: 1, lineDash: dash },
+                    });
+                }
+            }
+            return parts;
         }
 
         _obstrnCsp(props, isPoint) {
@@ -1027,7 +1172,7 @@
                 this.viewScaleDenom | 0,
                 props.DRVAL1, props.DRVAL2, props.VALDCO, props.depth,
                 props.COLOUR, props.BOYSHP, props.BCNSHP, props.TOPSHP,
-                props.SECTR1, props.SECTR2, props.VALNMR, props.ORIENT,
+                props.SECTR1, props.SECTR2, props.VALNMR, props.ORIENT, props.CATLIT,
                 props.OBJNAM, props.NOBJNM, props.LITCHR, props.SIGGRP, props.SIGPER,
                 props.HEIGHT, props.CATSLC, props.WATLEV, props.CATREA, props.RESTRN,
                 props.SCAMIN, props.SCAMAX,
@@ -1142,6 +1287,15 @@
                 }
             }
 
+            const isInlandWaterArea = isPoly && (layer === 'LAKARE' || layer === 'RIVERS' || layer === 'CANALS');
+            if (isInlandWaterArea) {
+                fill = this._inlandFreshWaterFillColor();
+                if (layer === 'LAKARE') {
+                    stroke = this.color('CHBLK');
+                    strokeWidth = Math.max(Number(strokeWidth) || 0, 1.05);
+                }
+            }
+
             const styles = [];
 
             // Polygon body
@@ -1238,13 +1392,18 @@
                     }
                 }
                 for (const sec of sectors) {
-                    for (const sectorGeom of this._lightSectorGeometries(center, sec)) {
+                    const nrParts = this._lightNominalRangeStyleParts(center, sec);
+                    for (const part of nrParts) {
                         styles.push(new ol.style.Style({
-                            geometry: sectorGeom,
-                            stroke: new ol.style.Stroke({
-                                color: sec.stroke,
-                                width: sec.strokeWidth || 1.2,
-                            }),
+                            geometry: part.geometry,
+                            fill: part.fill ? new ol.style.Fill({ color: part.fill }) : undefined,
+                            stroke: part.stroke
+                                ? new ol.style.Stroke({
+                                    color: part.stroke.color,
+                                    width: part.stroke.width,
+                                    lineDash: part.stroke.lineDash || undefined,
+                                })
+                                : undefined,
                             zIndex: zBase - 1,
                         }));
                     }
@@ -1327,43 +1486,6 @@
             }
         }
 
-        _lightSectorGeometries(center, sec) {
-            const start = sec.sectr1;
-            const end = sec.sectr2;
-            if (!Number.isFinite(start) || !Number.isFinite(end)) return [];
-            let sweep = end - start;
-            if (sweep < 0) sweep += 360;
-            if (sweep <= 0) return [];
-            const lonLat = ol.proj.toLonLat(center);
-            const startRad = (start * Math.PI) / 180;
-            const sweepRad = (sweep * Math.PI) / 180;
-
-            if (sweep >= 359.5 && !sec.legs) {
-                const circle = ol.geom.Polygon.circular(lonLat, sec.radiusM, 128);
-                circle.transform('EPSG:4326', 'EPSG:3857');
-                return [circle];
-            }
-
-            const steps = Math.max(64, Math.ceil(sweep / 2));
-            const arcCoords = [];
-            for (let i = 0; i <= steps; i++) {
-                const bearing = startRad + (sweepRad * i) / steps;
-                arcCoords.push(ol.proj.fromLonLat(ol.sphere.offset(lonLat, sec.radiusM, bearing)));
-            }
-            const geoms = [new ol.geom.LineString(arcCoords)];
-            if (sec.legs) {
-                geoms.push(new ol.geom.LineString([
-                    center,
-                    ol.proj.fromLonLat(ol.sphere.offset(lonLat, sec.radiusM, startRad)),
-                ]));
-                geoms.push(new ol.geom.LineString([
-                    center,
-                    ol.proj.fromLonLat(ol.sphere.offset(lonLat, sec.radiusM, startRad + sweepRad)),
-                ]));
-            }
-            return geoms;
-        }
-
         _autoLabels(layer, props, resolution) {
             const labels = [];
             const name = props.NOBJNM || props.OBJNAM;
@@ -1379,16 +1501,16 @@
                 });
             };
             if (layer === 'LIGHTS') {
-                if (this.settings.showLightDescriptions && resolution < 900) {
+                if (this.settings.showLightDescriptions && resolution < 6500) {
                     push(this._lightCharText(props), { size: 9, offsetY: 14, color: 'CHBLK' });
                 }
-                if (this.settings.showBuoyLightLabels && name && resolution < 1200) {
+                if (this.settings.showBuoyLightLabels && name && resolution < 6500) {
                     push(name, { size: 8, offsetY: 22 });
                 }
                 return labels;
             }
             if (layer === 'WRECKS') {
-                if (resolution < 1200) push('Wk', { size: 9, offsetY: 10, fontWeight: 'bold' });
+                if (resolution < 9000) push('Wk', { size: 9, offsetY: 10, fontWeight: 'bold' });
                 if (this.settings.showText && name && resolution < 400) push(name, { size: 8, offsetY: 24 });
                 return labels;
             }
@@ -1443,7 +1565,7 @@
                     : ` ${Math.round(height)}m`;
             }
             if (!isNaN(valnmr) && valnmr > 0) {
-                text += imperial ? ` ${valnmr}Nm` : ` ${valnmr}M`;
+                text += ` ${valnmr}Nm`;
             }
             return text.trim();
         }

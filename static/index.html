@@ -8,8 +8,8 @@
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@10.5.0/ol.css">
     <link rel="stylesheet" href="style.css">
     <link rel="preload" href="/default-viewport.json?v=1" as="fetch" crossorigin>
-    <link rel="preload" href="/s52-preslib.json?v=9" as="fetch" crossorigin>
-    <link rel="preload" href="/s52-preslib.js?v=11" as="script">
+    <link rel="preload" href="/s52-preslib.json?v=10" as="fetch" crossorigin>
+    <link rel="preload" href="/s52-preslib.js?v=17" as="script">
     <script>try{if(sessionStorage.getItem('s57viewer-admin-mode')==='1')document.documentElement.classList.add('admin-mode');}catch(e){}</script>
 </head>
 <body>
@@ -22,12 +22,16 @@
                 <path d="M13 12 Q20 8 27 12 Q30 16 27 20 Q20 24 13 20 Q10 16 13 12Z" fill="#2196F3" opacity="0.6"/>
             </svg>
             <span class="app-title">S-57 Web Viewer</span>
-            <span class="app-version">v0.0.3</span>
+            <span class="app-version">v0.0.4</span>
             <span class="admin-mode-indicator" id="admin-mode-indicator" aria-hidden="true">Admin</span>
         </a>
         <div class="top-controls">
             <nav class="header-nav-links" aria-label="Main navigation">
+                <button type="button" id="admin-mode-toggle" class="nav-admin-toggle" aria-pressed="false" title="관리자 모드 (Shift+F12)">Admin</button>
                 <a href="/docs.html" class="admin-only">Documentation</a>
+                <a href="/report.html">Analysis</a>
+                <button type="button" id="admin-console-toggle" class="nav-admin-toggle admin-only" aria-pressed="false" title="하단 로그 콘솔">Console</button>
+                <a href="/logs.html" class="admin-only" title="전체 화면 서버 로그">Logs</a>
                 <a href="https://docs.google.com/document/d/1duEzdO5jr04jgnnGRqFvlzImcVOBb6LAvQ2Fp5ufr_Q/edit?usp=sharing" target="_blank" rel="noopener noreferrer" class="admin-only">Feedback</a>
             </nav>
             <button type="button" id="sidebar-toggle" class="btn-sidebar-toggle" title="Show or hide side panel" aria-expanded="true" aria-controls="sidebar">
@@ -58,18 +62,7 @@
                     <span id="datasource-path" class="datasource-path">Loading demo charts…</span>
                     <span id="datasource-count" class="datasource-count"></span>
                 </div>
-                <div id="load-report-panel" class="load-report-panel hidden" aria-live="polite">
-                    <h4 class="load-report-heading">Folder analysis</h4>
-                    <div id="load-report-summary" class="load-report-summary"></div>
-                    <details id="load-report-details" class="load-report-details">
-                        <summary>Show details</summary>
-                        <div id="load-report-extra" class="load-report-extra"></div>
-                        <details class="load-report-details load-report-details-nested">
-                            <summary>Per-chart list</summary>
-                            <div id="load-report-detail-body" class="load-report-detail-body"></div>
-                        </details>
-                    </details>
-                </div>
+                <a href="/report.html" id="datasource-report-link" class="datasource-report-link hidden" title="Open detailed .000 file analysis report">.000 분석 결과 보기 →</a>
             </div>
 
             <div class="sidebar-section">
@@ -127,7 +120,7 @@
                     <input type="checkbox" id="toggle-light-desc" checked> Light descriptions
                 </label>
                 <label class="display-option">
-                    <input type="checkbox" id="toggle-visible-sectors"> Visible sector lights
+                    <input type="checkbox" id="toggle-visible-sectors" checked> Visible sector lights
                 </label>
                 <label class="display-option">
                     <input type="checkbox" id="toggle-buoy-labels" checked> Buoy/Light labels
@@ -136,9 +129,10 @@
 
             <div class="sidebar-section">
                 <h3 class="section-title">Display Option</h3>
+                <button type="button" class="btn-clean-display" id="btn-clean-display" title="넓은 축척에 맞는 권장 표시로 되돌립니다">권장 보기</button>
                 <div id="display-options">
                     <label class="display-option">
-                        <input type="checkbox" data-category="all" checked> Full Display
+                        <input type="checkbox" data-category="all"> Full Display
                     </label>
                     <label class="display-option">
                         <input type="checkbox" data-category="land" checked> Land
@@ -170,6 +164,9 @@
                     <label class="display-option">
                         <input type="checkbox" data-category="navigation" checked> Navigation
                     </label>
+                    <label class="display-option" title="분리 항로(TSS), 제한 구역, 정박지 등 — S-52 보라·자홍색 계열 선">
+                        <input type="checkbox" data-category="traffic"> TSS / 제한구역 / 정박지
+                    </label>
                     <label class="display-option">
                         <input type="checkbox" data-category="infrastructure" checked> Infrastructure
                     </label>
@@ -189,6 +186,10 @@
 
             <div class="sidebar-section">
                 <h3 class="section-title">Chart Info</h3>
+                <label class="display-option chart-extent-grid-toggle">
+                    <input type="checkbox" id="toggle-chart-extent-grid" title="인덱스된 각 .000 차트의 경계 상자와 내부 격자선">
+                    파일 영역 격자
+                </label>
                 <div id="chart-info">
                     <div class="info-row"><span>Charts loaded:</span><span id="info-charts">0</span></div>
                     <div class="info-row"><span>Matched in view:</span><span id="info-charts-matched">—</span></div>
@@ -202,38 +203,33 @@
                 </details>
             </div>
 
-            <div class="sidebar-section admin-only">
-                <h3 class="section-title">Legend</h3>
-                <div id="legend">
-                    <div class="legend-item"><span class="legend-swatch"></span> Land (LANDA)</div>
-                    <div class="legend-item"><span class="legend-swatch"></span> Very shallow (DEPVS)</div>
-                    <div class="legend-item"><span class="legend-swatch"></span> Shallow (DEPMS)</div>
-                    <div class="legend-item"><span class="legend-swatch"></span> Medium depth (DEPMD)</div>
-                    <div class="legend-item"><span class="legend-swatch swatch-circle"></span> Light</div>
-                    <div class="legend-item"><span class="legend-swatch swatch-circle"></span> Beacon</div>
-                    <div class="legend-item"><span class="legend-swatch swatch-circle"></span> Buoy</div>
-                    <div class="legend-item"><span class="legend-swatch swatch-x"></span> Wreck</div>
-                    <div class="legend-item"><span class="legend-swatch swatch-star"></span> Obstruction</div>
-                </div>
-                <p class="legend-note">IHO S-52 PresLib e4.0.0 (DAY)</p>
-            </div>
-
             <div class="sidebar-section app-meta admin-only">
                 <h3 class="section-title">About</h3>
                 <div id="app-about" class="app-about">
                     <p><span class="about-label">Author</span> Kim Kilyong</p>
                     <p><span class="about-label">Contact</span> <a href="mailto:ejavm83@gmail.com">ejavm83@gmail.com</a></p>
                     <p><span class="about-label">Affiliation</span> Korea Maritime University</p>
-                    <p><span class="about-label">Version</span> v0.0.3</p>
+                    <p><span class="about-label">Version</span> v0.0.4</p>
                     <p><span class="about-label">Release</span> 17 May 2026</p>
                     <p><span class="about-label">Visitors today</span> <span id="visitor-today">—</span></p>
                     <p><span class="about-label">Total visitors</span> <span id="visitor-total">—</span></p>
                     <p class="about-docs-link">
                         <a href="/docs.html">User guide &amp; documentation &rarr;</a><br>
+                        <a href="#" id="about-open-console" class="admin-only">로그 콘솔 열기</a><br>
+                        <a href="/logs.html" class="admin-only">서버 로그 (전체 화면) &rarr;</a><br>
                         <a href="https://github.com/ejavm83/s57viewer" target="_blank" rel="noopener">GitHub &rarr;</a>
                     </p>
                 </div>
             </div>
+            <div
+                id="sidebar-resize-handle"
+                class="sidebar-resize-handle"
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize panel"
+                tabindex="0"
+                title="Drag to resize panel"
+            ></div>
         </aside>
 
         <div id="map-container">
@@ -276,10 +272,70 @@
         </div>
     </div>
 
+    <aside id="admin-console" class="admin-console admin-only hidden" inert aria-hidden="true" aria-label="관리자 로그 콘솔">
+        <div id="admin-console-resize" class="admin-console-resize" role="separator" aria-orientation="horizontal" aria-label="콘솔 높이 조절" title="드래그하여 높이 조절"></div>
+        <header class="admin-console-header">
+            <div class="admin-console-tabs" role="tablist" aria-label="로그 종류">
+                <button type="button" class="admin-console-tab active" data-console-tab="server" role="tab" aria-selected="true">서버</button>
+                <button type="button" class="admin-console-tab" data-console-tab="process" role="tab" aria-selected="false">처리</button>
+            </div>
+            <div class="admin-console-toolbar">
+                <label class="admin-console-filter-label">레벨
+                    <select id="admin-console-filter-level">
+                        <option value="">전체</option>
+                        <option value="INFO" selected>INFO+</option>
+                        <option value="WARNING">WARNING+</option>
+                        <option value="ERROR">ERROR</option>
+                    </select>
+                </label>
+                <label class="admin-console-filter-label">검색
+                    <input type="search" id="admin-console-filter-search" placeholder="메시지" autocomplete="off">
+                </label>
+                <label class="admin-console-check" id="admin-console-server-tools">
+                    <input type="checkbox" id="admin-console-auto-refresh" checked> 자동 새로고침
+                </label>
+                <label class="admin-console-check">
+                    <input type="checkbox" id="admin-console-auto-scroll" checked> 자동 스크롤
+                </label>
+                <button type="button" id="admin-console-btn-refresh" class="admin-console-btn">새로고침</button>
+                <button type="button" id="admin-console-btn-copy" class="admin-console-btn">복사</button>
+                <button type="button" id="admin-console-btn-clear-server" class="admin-console-btn admin-console-btn-danger">서버 지우기</button>
+                <button type="button" id="admin-console-btn-clear-process" class="admin-console-btn admin-console-btn-danger hidden">처리 지우기</button>
+                <a href="/logs.html" class="admin-console-link" title="전체 화면">전체 화면 ↗</a>
+            </div>
+            <button type="button" id="admin-console-close" class="admin-console-close" title="콘솔 닫기" aria-label="콘솔 닫기">&times;</button>
+        </header>
+        <div id="admin-console-error" class="admin-console-error" role="alert"></div>
+        <div class="admin-console-body">
+            <div id="admin-console-server" class="admin-console-output" role="log"></div>
+            <div id="admin-console-process" class="admin-console-output hidden" role="log"></div>
+        </div>
+        <footer class="admin-console-footer">
+            <span id="admin-console-meta-left">—</span>
+            <span id="admin-console-meta-right"></span>
+        </footer>
+    </aside>
+
+    <!-- OpenLayers canvas renderer uses getImageData without willReadFrequently; silence Chrome warning (ExecutorGroup.js). -->
+    <script>
+    (function () {
+        var orig = HTMLCanvasElement.prototype.getContext;
+        HTMLCanvasElement.prototype.getContext = function (type, attrs) {
+            if (type === '2d') {
+                var base = attrs && typeof attrs === 'object' ? attrs : {};
+                attrs = Object.prototype.hasOwnProperty.call(base, 'willReadFrequently')
+                    ? base
+                    : Object.assign({}, base, { willReadFrequently: true });
+            }
+            return orig.call(this, type, attrs);
+        };
+    })();
+    </script>
     <script src="https://cdn.jsdelivr.net/npm/ol@10.5.0/dist/ol.js"></script>
     <script src="boot-cache.js?v=10"></script>
-    <script src="s52-preslib.js?v=11"></script>
-    <script src="app.js?v=29"></script>
+    <script src="s52-preslib.js?v=17"></script>
+    <script src="app.js?v=35"></script>
     <script src="admin-mode.js"></script>
+    <script src="admin-console.js"></script>
 </body>
 </html>

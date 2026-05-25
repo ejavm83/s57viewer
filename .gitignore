@@ -19,5 +19,5 @@ Thumbs.db
 
 .vercel
 
-# OpenCPN chartsymbols.xml is build-only (~2MB); see scripts/build_symbol_atlas.py
+# Optional local copy of OpenCPN chartsymbols.xml (~2MB); prefer scripts/sync_opencpn_s57data.py
 static/s57data/chartsymbols.xml
