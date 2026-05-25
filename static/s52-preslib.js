@@ -91,6 +91,40 @@
     const NO_LC_LAYERS = new Set(['COALNE', 'SLCONS', 'DEPCNT', 'TSELNE', 'TSSBND', 'LNDARE', 'M_COVR']);
     const LIGHT_AREA_PATTERN_LAYERS = new Set(['OBSTRN', 'UWTROC', 'WRECKS', 'DRGARE']);
 
+    /**
+     * OpenSPM / OpenCPN-style light flare: teardrop (S-52 LIGHTDEF–like), anchored at the
+     * tip toward the chart point. `rotation` is radians passed to ol.style.Icon (clockwise).
+     */
+    function buildLightFlareIconImage(fill, stroke, radiusPx, rotationRad) {
+        const r = Math.max(4, Math.min(12, radiusPx || 7));
+        const w = Math.ceil(r * 3.4);
+        const h = Math.ceil(r * 3.5);
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        const cx = w / 2;
+        const tipY = h - 0.75;
+        const rot = Number.isFinite(rotationRad) ? rotationRad : Math.PI * 0.78;
+        ctx.save();
+        ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
+        ctx.translate(cx, tipY);
+        ctx.rotate(rot);
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.bezierCurveTo(-r * 0.95, -r * 0.55, -r * 0.92, -r * 1.12, 0, -r * 1.42);
+        ctx.bezierCurveTo(r * 0.92, -r * 1.12, r * 0.95, -r * 0.55, 0, 0);
+        ctx.closePath();
+        ctx.fillStyle = fill;
+        ctx.strokeStyle = stroke;
+        ctx.lineWidth = 1.05;
+        ctx.fill();
+        ctx.stroke();
+        ctx.restore();
+        return { canvas, anchor: [cx / w, tipY / h] };
+    }
+
     function clamp(v, lo, hi) { return Math.min(Math.max(v, lo), hi); }
 
     /** Bucket map resolution for style caching (smooth wheel zoom reuses styles). */
@@ -320,6 +354,7 @@
             this.clearStyleCache();
             this._symbolCache.clear();
             this._patternCache.clear();
+            if (this._lightFlareIconCache) this._lightFlareIconCache.clear();
             this._loadSprite(target);
         }
 
@@ -893,7 +928,8 @@
                 kind: 'range_circle',
                 stroke: this.color(strokeTok),
                 radius: big ? 17 : 12,
-                strokeWidth: 1.25,
+                /** Thin ring like OpenSPM / paper-style ENC (≈1 px). */
+                strokeWidth: 1,
             };
         }
 
@@ -1033,18 +1069,22 @@
             const lonLat = ol.proj.toLonLat(center);
             const outline = this.color('CHBLK');
             const poly = this._navAnnulusPolygon(lonLat, sec.outerM, sec.innerM, sec.arcStartDeg, sec.arcEndDeg);
-            /** Fill CHYLW + OUTLW-style halo like OpenCPN DAY_BRIGHT raster (mOUTLWHCHYLW). */
-            const fillCol = this.color('CHYLW');
-            const haloCol = this.color('CHWHT');
+            /** Light nominal range: pale fill + thin yellow outline (OpenSPM-style). */
+            const fillCol = withAlpha(this.color('CHYLW'), 0.14);
+            const haloCol = withAlpha(this.color('CHWHT'), 0.35);
             const parts = [
                 {
                     geometry: poly,
                     fill: fillCol,
-                    stroke: { color: haloCol, width: 1.25 },
+                    stroke: { color: haloCol, width: 0.65 },
                 },
                 {
                     geometry: poly,
-                    stroke: { color: outline, width: 0.85 },
+                    stroke: { color: this.color('CHYLW'), width: 0.9 },
+                },
+                {
+                    geometry: poly,
+                    stroke: { color: outline, width: 0.55 },
                 },
             ];
             if (sec.legBearingsDeg && sec.legBearingsDeg.length === 2) {
@@ -1060,6 +1100,25 @@
                 }
             }
             return parts;
+        }
+
+        /**
+         * OpenSPM-style vector light flare (teardrop). COLOUR 3/4 → red/green flare;
+         * otherwise magenta (CHMGD) like LIGHTDEF / overview ENC practice.
+         */
+        _lightFlareVectorSpec(props) {
+            const cols = parseColourList(props);
+            const c0 = cols.length ? cols[0] : NaN;
+            let fillTok = 'CHMGD';
+            if (c0 === 3) fillTok = 'LITRD';
+            else if (c0 === 4) fillTok = 'LITGN';
+            return {
+                kind: 'light_flare',
+                fill: this.color(fillTok),
+                stroke: this.color('CHBLK'),
+                radius: 6.5,
+                rotation: Math.PI * 0.78,
+            };
         }
 
         _obstrnCsp(props, isPoint) {
@@ -1410,13 +1469,16 @@
                 }
 
                 let image = null;
-                if (symbolName) image = this.buildSymbol(symbolName, symbolRotation);
+                const syBase = symbolName ? String(symbolName).split(',')[0].trim() : '';
+                const useVectorLightFlare = layer === 'LIGHTS' && /^LIGHTS1[1-4]$/.test(syBase);
+                if (useVectorLightFlare) {
+                    image = this._fallbackSymbolImage(this._lightFlareVectorSpec(props));
+                } else if (symbolName) {
+                    image = this.buildSymbol(symbolName, symbolRotation);
+                }
                 if (!image && symbol) image = this._fallbackSymbolImage(symbol);
                 if (!image && layer === 'LIGHTS') {
-                    image = this._fallbackSymbolImage({
-                        kind: 'light_flare',
-                        fill: this.color('LITYW'), stroke: this.color('CHBLK'), radius: 6,
-                    });
+                    image = this._fallbackSymbolImage(this._lightFlareVectorSpec(props));
                 }
                 if (image) {
                     styles.push(new ol.style.Style({ image, zIndex: zBase + 3 }));
@@ -1424,6 +1486,10 @@
             }
 
             for (const lb of labels.concat(this._autoLabels(layer, props, resolution))) {
+                const paperLightText = layer === 'LIGHTS' && isPoint;
+                const halo = (lb.subtleHalo || paperLightText)
+                    ? new ol.style.Stroke({ color: 'rgba(255,255,255,0.42)', width: 1 })
+                    : new ol.style.Stroke({ color: 'rgba(255,255,255,0.9)', width: 2.5 });
                 styles.push(new ol.style.Style({
                     text: new ol.style.Text({
                         text: lb.text,
@@ -1431,7 +1497,7 @@
                         offsetX: lb.offsetX || 0,
                         offsetY: lb.offsetY || 0,
                         fill: new ol.style.Fill({ color: lb.color }),
-                        stroke: new ol.style.Stroke({ color: 'rgba(255,255,255,0.9)', width: 2.5 }),
+                        stroke: halo,
                         overflow: !isPoint,
                     }),
                     zIndex: zBase + 5,
@@ -1470,8 +1536,30 @@
                     return new ol.style.RegularShape({ points: 4, radius: spec.radius || 6, fill, stroke, angle: Math.PI / 4 });
                 case 'star':
                     return new ol.style.RegularShape({ points: 5, radius: spec.radius || 6, radius2: (spec.radius || 6) / 2, fill, stroke });
-                case 'light_flare':
-                    return new ol.style.RegularShape({ points: 4, radius: spec.radius || 6, radius2: 2, fill, stroke, angle: Math.PI / 4 });
+                case 'light_flare': {
+                    const r = spec.radius || 7;
+                    const rot = Number.isFinite(spec.rotation) ? spec.rotation : Math.PI * 0.78;
+                    const key = `lf|${spec.fill}|${spec.stroke}|${r}|${rot.toFixed(4)}`;
+                    if (!this._lightFlareIconCache) this._lightFlareIconCache = new Map();
+                    let icon = this._lightFlareIconCache.get(key);
+                    if (!icon) {
+                        const { canvas, anchor } = buildLightFlareIconImage(
+                            spec.fill || '#c545c3',
+                            spec.stroke || '#070707',
+                            r,
+                            rot
+                        );
+                        icon = new ol.style.Icon({
+                            img: canvas,
+                            imgSize: [canvas.width, canvas.height],
+                            anchor,
+                            scale: 1,
+                        });
+                        if (this._lightFlareIconCache.size > 48) this._lightFlareIconCache.clear();
+                        this._lightFlareIconCache.set(key, icon);
+                    }
+                    return icon;
+                }
                 case 'range_circle':
                     return new ol.style.Circle({
                         radius: spec.radius || 18,
@@ -1498,14 +1586,17 @@
                     offsetX: opts.offsetX || 0,
                     offsetY: opts.offsetY || 14,
                     fontWeight: opts.fontWeight || 'normal',
+                    subtleHalo: !!opts.subtleHalo,
                 });
             };
             if (layer === 'LIGHTS') {
                 if (this.settings.showLightDescriptions && resolution < 6500) {
-                    push(this._lightCharText(props), { size: 9, offsetY: 14, color: 'CHBLK' });
+                    push(this._lightCharText(props), {
+                        size: 9, offsetY: 14, color: 'CHBLK', subtleHalo: true,
+                    });
                 }
                 if (this.settings.showBuoyLightLabels && name && resolution < 6500) {
-                    push(name, { size: 8, offsetY: 22 });
+                    push(name, { size: 8, offsetY: 22, subtleHalo: true });
                 }
                 return labels;
             }
@@ -1565,7 +1656,7 @@
                     : ` ${Math.round(height)}m`;
             }
             if (!isNaN(valnmr) && valnmr > 0) {
-                text += ` ${valnmr}Nm`;
+                text += ` ${valnmr}nM`;
             }
             return text.trim();
         }

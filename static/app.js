@@ -502,20 +502,29 @@
         if (bootPreviewPromise) return bootPreviewPromise;
 
         bootPreviewPromise = (async function () {
+            let bundle = null;
+            let ds = null;
             try {
-                const dsResp = await fetch('/api/datasource');
-                const ds = await dsResp.json();
-                if (ds.loaded && !isDefaultSampleLoaded(ds)) return false;
+                const bundlePromise = bootBundlePrefetch
+                    ? bootBundlePrefetch
+                    : BootCache.loadDefaultViewport();
+                const dsPromise = fetchDatasourceResilient()
+                    .then(function (r) { return r.ok ? r.data : null; })
+                    .catch(function () { return null; });
+                [ds, bundle] = await Promise.all([dsPromise, bundlePromise]);
             } catch (e) {
-                /* continue with bundled preview */
+                /* bundle or status fetch failed — try static/IDB bundle once more below */
             }
+            bootBundlePrefetch = null;
 
             if (userHasPannedMap) return false;
+            if (ds && ds.loaded && !isDefaultSampleLoaded(ds)) return false;
 
-            const bundle = bootBundlePrefetch
-                ? await bootBundlePrefetch
-                : await BootCache.loadDefaultViewport();
-            bootBundlePrefetch = null;
+            if (!bundle || !bundle.data || !bundle.data.features || !bundle.data.features.length) {
+                try {
+                    bundle = await BootCache.loadDefaultViewport();
+                } catch (e2) { /* ignore */ }
+            }
             if (!bundle || !bundle.data || !bundle.data.features || !bundle.data.features.length) {
                 return false;
             }
@@ -1469,6 +1478,76 @@
         throw lastError || new Error('Failed to fetch');
     }
 
+    /** Cold gateways (Render) often return 502/503 or truncated HTML bodies — retry a few times. */
+    function isRetriableHttpStatus(status) {
+        return (
+            status === 408 ||
+            status === 429 ||
+            status === 502 ||
+            status === 503 ||
+            status === 504 ||
+            status === 524
+        );
+    }
+
+    /**
+     * fetch + JSON with retries for empty/truncated bodies and transient HTTP errors.
+     * @returns {{ ok: boolean, status: number, data: any }}
+     */
+    async function fetchJsonResilient(url, options, retryOpts) {
+        const maxAttempts = (retryOpts && retryOpts.maxAttempts) || 12;
+        const delayMs = (retryOpts && retryOpts.delayMs) || 380;
+        let lastErr = null;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                const resp = await fetch(url, options);
+                const text = await resp.text();
+                let data = null;
+                if (text && text.trim()) {
+                    try {
+                        data = JSON.parse(text);
+                    } catch (parseErr) {
+                        lastErr = parseErr;
+                        if (attempt < maxAttempts && (isRetriableHttpStatus(resp.status) || resp.ok)) {
+                            await sleep(delayMs * Math.min(attempt, 5));
+                            continue;
+                        }
+                        throw parseErr;
+                    }
+                } else if (attempt < maxAttempts) {
+                    await sleep(delayMs * Math.min(attempt, 5));
+                    continue;
+                }
+                if (!resp.ok && isRetriableHttpStatus(resp.status) && attempt < maxAttempts) {
+                    await sleep(delayMs * Math.min(attempt, 5));
+                    continue;
+                }
+                return { ok: resp.ok, status: resp.status, data };
+            } catch (err) {
+                lastErr = err;
+                if (!isTransientFetchError(err) || attempt >= maxAttempts) {
+                    throw err;
+                }
+                await sleep(delayMs * Math.min(attempt, 5));
+            }
+        }
+        throw lastErr || new Error('fetchJsonResilient failed');
+    }
+
+    /** Coalesce parallel boot-time GET /api/datasource (preslib + default sample paths). */
+    let datasourceResilientInflight = null;
+    async function fetchDatasourceResilient() {
+        if (!datasourceResilientInflight) {
+            datasourceResilientInflight = fetchJsonResilient('/api/datasource', undefined, {
+                maxAttempts: 14,
+                delayMs: 400,
+            }).finally(function () {
+                datasourceResilientInflight = null;
+            });
+        }
+        return datasourceResilientInflight;
+    }
+
     function updateProgressUI(opts) {
         const messageEl = document.getElementById('loading-message');
         const progressEl = document.getElementById('loading-progress');
@@ -1512,18 +1591,29 @@
                 });
             } catch (err) {
                 if (isTransientFetchError(err)) {
-                    const dsResp = await fetchJsonWithRetry('/api/datasource', undefined, {
-                        maxAttempts: 20,
-                        delayMs: 500,
+                    const fr = await fetchJsonResilient('/api/datasource', undefined, {
+                        maxAttempts: 12,
+                        delayMs: 450,
                     });
-                    const ds = await dsResp.json();
-                    if (ds.loaded) return ds;
+                    const ds = fr.data;
+                    if (fr.ok && ds && ds.loaded) return ds;
                 }
                 throw err;
             }
 
             reconnecting = false;
-            const p = await resp.json();
+            let p;
+            try {
+                const progressText = await resp.text();
+                if (!progressText || !progressText.trim()) {
+                    await sleep(400);
+                    continue;
+                }
+                p = JSON.parse(progressText);
+            } catch (parseErr) {
+                await sleep(400);
+                continue;
+            }
 
             let detail = '';
             if (p.total > 0 && p.phase !== 'scan') {
@@ -1541,9 +1631,14 @@
 
             if (p.status === 'done') {
                 if (!p.result) {
-                    const dsResp = await fetchJsonWithRetry('/api/datasource');
-                    const ds = await dsResp.json();
-                    if (!ds.loaded) throw new Error('Load finished but chart data is unavailable.');
+                    const fr = await fetchJsonResilient('/api/datasource', undefined, {
+                        maxAttempts: 12,
+                        delayMs: 400,
+                    });
+                    const ds = fr.data;
+                    if (!fr.ok || !ds || !ds.loaded) {
+                        throw new Error('Load finished but chart data is unavailable.');
+                    }
                     return ds;
                 }
                 return p.result;
@@ -1553,11 +1648,12 @@
                 throw new Error(p.error || p.message || 'Failed to load chart data');
             }
             if (p.status === 'idle') {
-                const dsResp = await fetch('/api/datasource');
-                if (dsResp.ok) {
-                    const ds = await dsResp.json();
-                    if (ds.loaded) return ds;
-                }
+                const fr = await fetchJsonResilient('/api/datasource', undefined, {
+                    maxAttempts: 10,
+                    delayMs: 400,
+                });
+                const ds = fr.data;
+                if (fr.ok && ds && ds.loaded) return ds;
                 throw new Error(
                     'Load was interrupted (the dev server may have restarted). Try Select folder again.'
                 );
@@ -1684,9 +1780,11 @@
     }
 
     async function waitForDefaultSampleReady() {
-        const resp = await fetch('/api/datasource/default', { method: 'POST' });
-        const data = await resp.json();
-        if (!resp.ok) throw new Error(data.detail || 'Failed to load default sample');
+        const { ok, data } = await fetchJsonResilient('/api/datasource/default', { method: 'POST' }, {
+            maxAttempts: 14,
+            delayMs: 450,
+        });
+        if (!ok) throw new Error((data && data.detail) || 'Failed to load default sample');
         if (data.loaded) return data;
         if (data.status === 'started') return waitForDatasourceLoad();
         throw new Error('Unexpected response while loading default sample');
@@ -1697,8 +1795,10 @@
         setDatasourceButtonsDisabled(true);
         showLoading(true, 'subtle');
         try {
-            const dsResp = await fetch('/api/datasource');
-            const ds = await dsResp.json();
+            const { ok, data: ds } = await fetchDatasourceResilient();
+            if (!ok || !ds) {
+                throw new Error('Could not read data source status from server');
+            }
             const sampleLabel = ds.default_sample_dir
                 ? ds.default_sample_dir.split(/[/\\]/).pop()
                 : 'sample';
@@ -1714,8 +1814,11 @@
                 return;
             }
 
-            const progResp = await fetch('/api/datasource/progress');
-            const prog = await progResp.json();
+            const progFr = await fetchJsonResilient('/api/datasource/progress', undefined, {
+                maxAttempts: 10,
+                delayMs: 350,
+            });
+            const prog = progFr.ok ? progFr.data : { status: 'idle' };
 
             let result;
             if (prog.status === 'running') {
@@ -2335,8 +2438,9 @@
                 pendingDatasourceResult = null;
                 await finishDatasourceDisplay(pending);
             } else if (datasourceReady && !datasourceDisplaySettled) {
-                const ds = await fetch('/api/datasource').then(function (r) { return r.json(); });
-                await finishDatasourceDisplay(ds);
+                const fr = await fetchDatasourceResilient().catch(function () { return null; });
+                const ds = fr && fr.ok ? fr.data : null;
+                if (ds) await finishDatasourceDisplay(ds);
             } else if (datasourceReady && datasourceDisplaySettled && bootPreviewActive && mapDisplayReady) {
                 setTimeout(tryLoadCharts, 50);
             } else if (!bootShown) {
@@ -2360,8 +2464,9 @@
                 pendingDatasourceResult = null;
                 await finishDatasourceDisplay(pending);
             } else if (datasourceReady && !datasourceDisplaySettled) {
-                const ds = await fetch('/api/datasource').then(function (r) { return r.json(); });
-                await finishDatasourceDisplay(ds);
+                const fr = await fetchDatasourceResilient().catch(function () { return null; });
+                const ds = fr && fr.ok ? fr.data : null;
+                if (ds) await finishDatasourceDisplay(ds);
             } else if (datasourceReady) {
                 tryLoadCharts();
             }
